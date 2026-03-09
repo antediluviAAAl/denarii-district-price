@@ -603,8 +603,8 @@ class eBaySource(AbstractMarketSource):
             if str(target_year) not in title: continue
             
             nominal = query.replace(str(target_year), "").strip().lower()
-            nominal_parts = nominal.split()
-            if not all(part in title_lower for part in nominal_parts):
+            # Strict phrase match: "5 lei" must appear as a contiguous phrase, not scattered words
+            if nominal not in title_lower:
                 continue
                 
             if any(term in title_lower for term in cls.SLAB_TERMS): continue
