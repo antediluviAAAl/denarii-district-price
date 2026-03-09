@@ -60,7 +60,7 @@ class ProxyNetwork:
             return {"http": px, "https": px}
         return None
 
-def smart_fetch(url: str, headers: dict = None, expected_texts: list = None, retry_limit: int = 3, label: str = "CORE") -> Optional[str]:
+def smart_fetch(url: str, headers: dict = None, expected_texts: list = None, retry_limit: int = 10, label: str = "CORE") -> Optional[str]:
     """Retries HTTP GET requests behind rotating proxies with Cloudflare fingerprint mimicry."""
     for attempt in range(1, retry_limit + 1):
         proxy_dict = ProxyNetwork.get_random_proxy()
