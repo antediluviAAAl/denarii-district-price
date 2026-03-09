@@ -122,7 +122,7 @@ class NGCScraper:
         }
         
         try:
-            page_text = smart_fetch(search_url, headers=headers, retry_limit=3, label="NGC DISCOVERY")
+            page_text = smart_fetch(search_url, headers=headers, retry_limit=10, label="NGC DISCOVERY")
             if not page_text:
                 return None
             soup = BeautifulSoup(page_text, 'html.parser')
@@ -158,7 +158,7 @@ class NGCScraper:
             "Upgrade-Insecure-Requests": "1"
         }
         
-        page_text = smart_fetch(url, headers=headers, expected_texts=["value", "5 francs", "mintage", "uxpricetablefixedcolumns_dxmaintable"], retry_limit=3, label="NGC")
+        page_text = smart_fetch(url, headers=headers, expected_texts=["value", "5 francs", "mintage", "uxpricetablefixedcolumns_dxmaintable"], retry_limit=10, label="NGC")
                 
         if not page_text:
              print(f"{Colors.RED}⛔ [!] [NGC] Cloudflare Turnstile explicitly blocked requests or proxy failed.{Colors.RESET}")
@@ -263,7 +263,7 @@ class NumistaScraper:
         
         print(f"{Colors.CYAN}🔍 [*] [NUMISTA] Querying Discovery Proxy (DuckDuckGo): {proxy_query}{Colors.RESET}")
         
-        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="NUMISTA DISCOVERY")
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="NUMISTA DISCOVERY")
         if not page_text:
             return None
             
@@ -285,7 +285,7 @@ class NumistaScraper:
             print(f"{Colors.YELLOW}👻 [-] [NUMISTA] Target query '{query}' not found via proxy.{Colors.RESET}")
             return []
             
-        page_text = smart_fetch(coin_url, headers=cls.get_headers(), retry_limit=3, label="NUMISTA")
+        page_text = smart_fetch(coin_url, headers=cls.get_headers(), retry_limit=10, label="NUMISTA")
         if not page_text:
             print(f"{Colors.YELLOW}⚠️  [!] [NUMISTA] Failed to access catalog page directly.{Colors.RESET}")
             return []
@@ -417,7 +417,7 @@ class MAShopsSource(AbstractMarketSource):
         search_url = f"{Config.MASHOPS_BASE_URL}?searchstr={encoded_query}&submitBtn=Search"
         
         print(f"{Colors.CYAN}🌐 [NETWORK] [MA-SHOPS] Querying Live Retail Ceiling: {search_url}{Colors.RESET}")
-        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="MA-SHOPS")
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="MA-SHOPS")
         
         if not page_text:
             return []
@@ -576,7 +576,7 @@ class eBaySource(AbstractMarketSource):
             "upgrade-insecure-requests": "1"
         }
         
-        page_text = smart_fetch(url, headers=headers, retry_limit=4, label=source_tag.upper())
+        page_text = smart_fetch(url, headers=headers, retry_limit=10, label=source_tag.upper())
         if not page_text:
             return []
 
@@ -709,7 +709,7 @@ class OkaziiSource(AbstractMarketSource):
         if not is_sold:
             encoded_query = urllib.parse.quote_plus(query)
             search_url = f"https://www.okazii.ro/cautare/{encoded_query}.html"
-            page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="OKAZII SEARCH")
+            page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="OKAZII SEARCH")
             if page_text:
                 soup = BeautifulSoup(page_text, "lxml")
                 links = []
@@ -724,7 +724,7 @@ class OkaziiSource(AbstractMarketSource):
         encoded_query = urllib.parse.quote_plus(proxy_query)
         search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
         
-        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="OKAZII DDG")
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="OKAZII DDG")
         if not page_text:
             return []
             
@@ -753,7 +753,7 @@ class OkaziiSource(AbstractMarketSource):
         
         results = []
         for link in links:
-            page_text = smart_fetch(link, headers=cls.get_headers(), retry_limit=3, label=f"OKAZII {mode_str}")
+            page_text = smart_fetch(link, headers=cls.get_headers(), retry_limit=10, label=f"OKAZII {mode_str}")
             if not page_text: continue
             
             soup = BeautifulSoup(page_text, 'lxml')
