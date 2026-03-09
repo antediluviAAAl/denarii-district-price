@@ -7,6 +7,7 @@ import os
 import random
 from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
+import concurrent.futures
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
@@ -53,6 +54,48 @@ class ProxyNetwork:
             return {"http": px, "https": px}
         return None
 
+def smart_fetch(url: str, headers: dict = None, expected_texts: list = None, retry_limit: int = 3, label: str = "CORE") -> Optional[str]:
+    """Retries HTTP GET requests behind rotating proxies with Cloudflare fingerprint mimicry."""
+    for attempt in range(1, retry_limit + 1):
+        proxy_dict = ProxyNetwork.get_random_proxy()
+        proxy_ip = proxy_dict['http'].split('@')[-1] if proxy_dict else "Local IP"
+        timeout_val = 15 if attempt == 1 else 25
+        
+        try:
+            with requests.Session(impersonate="chrome110", proxies=proxy_dict, timeout=timeout_val) as session:
+                res = session.get(url, headers=headers)
+                
+            if res.status_code in [403, 429, 502, 503]:
+                print(f"{Colors.YELLOW}⚠️  [!] [{label}] Attempt {attempt} Blocked (HTTP {res.status_code}). Rotating IP...{Colors.RESET}")
+                continue
+            elif res.status_code != 200:
+                print(f"{Colors.YELLOW}⚠️  [!] [{label}] Attempt {attempt} Failed (HTTP {res.status_code}). Rotating IP...{Colors.RESET}")
+                continue
+                
+            text_lower = res.text.lower()
+            if "captcha" in text_lower or (hasattr(res, 'url') and "splashui/challenge" in res.url.lower()):
+                print(f"{Colors.YELLOW}⚠️  [!] [{label}] Attempt {attempt} hit CAPTCHA/Validation fail on proxy {proxy_ip}. Rotating IP...{Colors.RESET}")
+                continue
+                
+            if expected_texts:
+                if not any(t in text_lower for t in expected_texts):
+                    print(f"{Colors.YELLOW}⚠️  [!] [{label}] Attempt {attempt} missing expected payload. Rotating IP...{Colors.RESET}")
+                    continue
+                
+            if attempt > 1:
+                print(f"{Colors.GREEN}✅ [+] [{label}] Retry successful on proxy ({proxy_ip}).{Colors.RESET}")
+            else:
+                 print(f"{Colors.GREEN}✅ [+] [{label}] WAF Bypassed headlessly via Proxy ({proxy_ip}).{Colors.RESET}")
+                 
+            return res.text
+            
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠️  [!] [{label}] Attempt {attempt} Network Error: {str(e)}. Rotating IP...{Colors.RESET}")
+            continue
+            
+    print(f"{Colors.RED}❌ [!] [{label}] Max retries ({retry_limit}) exhausted. Endpoint unreachable.{Colors.RESET}")
+    return None
+
 # ==========================================
 # PHASE 1: NGC CATALOG BASELINE EXTRACTOR
 # ==========================================
@@ -73,18 +116,19 @@ class NGCScraper:
         }
         
         try:
-            with requests.Session(impersonate="chrome110", timeout=15) as session:
-                res = session.get(search_url, headers=headers)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                
-                for a_tag in soup.select('a.result__url'):
-                    href = a_tag.get('href', '')
-                    if 'uddg=' in href:
-                        raw_url = href.split('uddg=')[1].split('&')[0]
-                        clean_url = urllib.parse.unquote(raw_url)
-                        if "ngccoin.com/price-guide/world" in clean_url and country.lower() in clean_url.lower():
-                            print(f"{Colors.GREEN}🎯 [+] [NGC] Discovered Target Catalog URL: {clean_url}{Colors.RESET}")
-                            return clean_url
+            page_text = smart_fetch(search_url, headers=headers, retry_limit=3, label="NGC DISCOVERY")
+            if not page_text:
+                return None
+            soup = BeautifulSoup(page_text, 'html.parser')
+            
+            for a_tag in soup.select('a.result__url'):
+                href = a_tag.get('href', '')
+                if 'uddg=' in href:
+                    raw_url = href.split('uddg=')[1].split('&')[0]
+                    clean_url = urllib.parse.unquote(raw_url)
+                    if "ngccoin.com/price-guide/world" in clean_url and country.lower() in clean_url.lower():
+                        print(f"{Colors.GREEN}🎯 [+] [NGC] Discovered Target Catalog URL: {clean_url}{Colors.RESET}")
+                        return clean_url
         except Exception as e:
             print(f"{Colors.RED}❌ [-] [NGC] Discovery engine failed: {str(e)}{Colors.RESET}")
             
@@ -108,23 +152,10 @@ class NGCScraper:
             "Upgrade-Insecure-Requests": "1"
         }
         
-        page_text = ""
-        for proxy in proxies:
-            proxy_dict = {"http": proxy, "https": proxy} if proxy else None
-            try:
-                with requests.Session(impersonate="chrome110", proxies=proxy_dict) as session:
-                    res = session.get(url, headers=headers, timeout=15)
-                    raw_html = res.text.lower()
-                    if res.status_code == 200 and ("value" in raw_html or "5 francs" in raw_html or 'mintage' in raw_html or 'uxPriceTableFixedColumns_DXMainTable' in res.text):
-                        page_text = res.text
-                        proxy_ip = proxy.split('@')[-1] if proxy else 'Local IP'
-                        print(f"{Colors.GREEN}✅ [+] [NGC] WAF Bypassed headlessly via Proxy ({proxy_ip}).{Colors.RESET}")
-                        break
-            except Exception:
-                continue
+        page_text = smart_fetch(url, headers=headers, expected_texts=["value", "5 francs", "mintage", "uxpricetablefixedcolumns_dxmaintable"], retry_limit=3, label="NGC")
                 
         if not page_text:
-             print(f"{Colors.RED}⛔ [!] [NGC] All proxies failed or Cloudflare Turnstile explicitly blocked every request.{Colors.RESET}")
+             print(f"{Colors.RED}⛔ [!] [NGC] Cloudflare Turnstile explicitly blocked requests or proxy failed.{Colors.RESET}")
              return []
              
         soup = BeautifulSoup(page_text, 'html.parser')
@@ -219,18 +250,18 @@ class NumistaScraper:
         }
 
     @classmethod
-    def find_numista_url_via_proxy(cls, query, session):
+    def find_numista_url_via_proxy(cls, query):
         proxy_query = f"{query} numista"
         encoded_query = urllib.parse.quote_plus(proxy_query)
         search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
         
         print(f"{Colors.CYAN}🔍 [*] [NUMISTA] Querying Discovery Proxy (DuckDuckGo): {proxy_query}{Colors.RESET}")
-        res = session.get(search_url, headers=cls.get_headers())
         
-        if res.status_code != 200:
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="NUMISTA DISCOVERY")
+        if not page_text:
             return None
             
-        decoded_html = urllib.parse.unquote(res.text)
+        decoded_html = urllib.parse.unquote(page_text)
         numista_pattern = r'https://en\.numista\.com/(?:catalogue/pieces\d+\.html|\d+)'
         matches = re.findall(numista_pattern, decoded_html)
         
@@ -240,23 +271,20 @@ class NumistaScraper:
         return None
 
     @classmethod
-    def extract_baselines(cls, query: str, target_year: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def extract_baselines(cls, query: str, target_year: str) -> List[Dict[str, Any]]:
         print(f"{Colors.BLUE}🌐 [~] [NUMISTA] Network: Harvesting Secondary Data Matrix...{Colors.RESET}")
         
-        coin_url = cls.find_numista_url_via_proxy(query, session)
+        coin_url = cls.find_numista_url_via_proxy(query)
         if not coin_url:
             print(f"{Colors.YELLOW}👻 [-] [NUMISTA] Target query '{query}' not found via proxy.{Colors.RESET}")
             return []
             
-        # Fetch the Numista Catalog natively using Direct IP. Datacenter proxies trigger 403.
-        with requests.Session(impersonate="chrome110", timeout=15) as direct_session:
-            res = direct_session.get(coin_url, headers=cls.get_headers())
-            
-        if res.status_code != 200:
-            print(f"{Colors.YELLOW}⚠️  [!] [NUMISTA] Failed to access catalog page directly. HTTP {res.status_code}{Colors.RESET}")
+        page_text = smart_fetch(coin_url, headers=cls.get_headers(), retry_limit=3, label="NUMISTA")
+        if not page_text:
+            print(f"{Colors.YELLOW}⚠️  [!] [NUMISTA] Failed to access catalog page directly.{Colors.RESET}")
             return []
 
-        soup = BeautifulSoup(res.text, 'lxml')
+        soup = BeautifulSoup(page_text, 'lxml')
         
         page_text = soup.get_text(separator=" ", strip=True)
         curr_match = re.search(r'Values.{0,50}in\s*([A-Za-z]+)', page_text)
@@ -332,12 +360,12 @@ class NumistaScraper:
 class AbstractMarketSource(ABC):
     @classmethod
     @abstractmethod
-    def fetch_active(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         pass
         
     @classmethod
     @abstractmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         pass
 
     @classmethod
@@ -351,7 +379,7 @@ class AbstractMarketSource(ABC):
 # ==========================================
 class MAShopsSource(AbstractMarketSource):
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         # MA-Shops does not expose public historical liquidity/sold deals out of the box
         return []
 
@@ -377,19 +405,18 @@ class MAShopsSource(AbstractMarketSource):
         }
 
     @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         """Maps live retail table rows safely mapping Dual Layout A/B variants."""
         encoded_query = urllib.parse.quote_plus(query)
         search_url = f"{Config.MASHOPS_BASE_URL}?searchstr={encoded_query}&submitBtn=Search"
         
         print(f"{Colors.CYAN}🌐 [NETWORK] [MA-SHOPS] Querying Live Retail Ceiling: {search_url}{Colors.RESET}")
-        res = session.get(search_url, headers=cls.get_headers())
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="MA-SHOPS")
         
-        if res.status_code != 200:
-            print(f"{Colors.RED}❌ [!] [MA-SHOPS] Request Blocked HTTP {res.status_code}{Colors.RESET}")
+        if not page_text:
             return []
             
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(page_text, 'html.parser')
         rows = soup.find_all('tr')
         print(f"{Colors.BLUE}🔍 [PARSER] [MA-SHOPS] Searching DOM entries...{Colors.RESET}")
         
@@ -536,22 +563,18 @@ class eBaySource(AbstractMarketSource):
         return "UNGRADED"
 
     @classmethod
-    def run_ebay_search(cls, url: str, query: str, target_year: str, country: str, source_tag: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def run_ebay_search(cls, url: str, query: str, target_year: str, country: str, source_tag: str) -> List[Dict[str, Any]]:
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "upgrade-insecure-requests": "1"
         }
-        res = session.get(url, headers=headers)
-        if res.status_code != 200:
-            print(f"{Colors.RED}❌ [!] [EBAY] Request Blocked HTTP {res.status_code}{Colors.RESET}")
-            return []
-            
-        if "captcha" in res.text.lower() or "splashui/challenge" in res.url:
-            print(f"{Colors.RED}❌ [!] [EBAY] CRITICAL: eBay served CAPTCHA. Soft-banned.{Colors.RESET}")
+        
+        page_text = smart_fetch(url, headers=headers, retry_limit=4, label=source_tag.upper())
+        if not page_text:
             return []
 
-        soup = BeautifulSoup(res.text, 'lxml')
+        soup = BeautifulSoup(page_text, 'lxml')
         results_list = soup.find('ul', class_=re.compile(r'srp-results'))
         if not results_list: return []
 
@@ -624,18 +647,18 @@ class eBaySource(AbstractMarketSource):
         return parsed_listings
 
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_Sold=1&LH_Complete=1"
         print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY SOLD] Querying Sold Liquidity Floor: {url}{Colors.RESET}")
-        return cls.run_ebay_search(url, query, target_year, country, "eBay (Sold)", session)
+        return cls.run_ebay_search(url, query, target_year, country, "eBay (Sold)")
 
     @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000"
         print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Active Live Deals: {url}{Colors.RESET}")
-        return cls.run_ebay_search(url, query, target_year, country, "eBay (Active)", session)
+        return cls.run_ebay_search(url, query, target_year, country, "eBay (Active)")
 
 # ==========================================
 # PHASE 5: OKAZII ROMANIAN MARKET EXTRACTOR
@@ -676,13 +699,13 @@ class OkaziiSource(AbstractMarketSource):
         }
 
     @classmethod
-    def get_okazii_links(cls, query, is_sold, session):
+    def get_okazii_links(cls, query, is_sold):
         if not is_sold:
             encoded_query = urllib.parse.quote_plus(query)
             search_url = f"https://www.okazii.ro/cautare/{encoded_query}.html"
-            res = session.get(search_url, headers=cls.get_headers())
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, "lxml")
+            page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="OKAZII SEARCH")
+            if page_text:
+                soup = BeautifulSoup(page_text, "lxml")
                 links = []
                 for a in soup.find_all('a', href=True):
                     href = a['href']
@@ -695,40 +718,39 @@ class OkaziiSource(AbstractMarketSource):
         encoded_query = urllib.parse.quote_plus(proxy_query)
         search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
         
-        res = session.get(search_url, headers=cls.get_headers())
-        if res.status_code != 200: 
-            print(f"{Colors.YELLOW}⚠️  [!] [OKAZII DDG] Returned HTTP {res.status_code}. Retry with rotation.{Colors.RESET}")
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=3, label="OKAZII DDG")
+        if not page_text:
             return []
             
-        decoded_html = urllib.parse.unquote(res.text)
+        decoded_html = urllib.parse.unquote(page_text)
         okazii_pattern = r'https://(?:www\.)?okazii\.ro/(?!recomandate|cautare|catalog)[^\s"\'<>]+-a\d{8,}'
         raw_matches = re.findall(okazii_pattern, decoded_html)
         return list(dict.fromkeys(raw_matches))[:10]
 
     @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, False, session)
+    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+        return cls._fetch_listings(query, target_year, country, False)
 
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str, session: requests.Session) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, True, session)
+    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+        return cls._fetch_listings(query, target_year, country, True)
 
     @classmethod
-    def _fetch_listings(cls, query: str, target_year: str, country: str, is_sold: bool, session: requests.Session) -> List[Dict[str, Any]]:
+    def _fetch_listings(cls, query: str, target_year: str, country: str, is_sold: bool) -> List[Dict[str, Any]]:
         mode_str = "SOLD" if is_sold else "ACTIVE"
         print(f"{Colors.CYAN}🌐 [NETWORK] [OKAZII {mode_str}] Querying Discovery Proxy for Romanian Listings...{Colors.RESET}")
         
-        links = cls.get_okazii_links(query, is_sold, session)
+        links = cls.get_okazii_links(query, is_sold)
         if not links: return []
         
         print(f"{Colors.BLUE}🔍 [PARSER] [OKAZII {mode_str}] Evaluating {len(links)} DOM entry points...{Colors.RESET}")
         
         results = []
         for link in links:
-            res = session.get(link, headers=cls.get_headers())
-            if res.status_code != 200: continue
+            page_text = smart_fetch(link, headers=cls.get_headers(), retry_limit=3, label=f"OKAZII {mode_str}")
+            if not page_text: continue
             
-            soup = BeautifulSoup(res.text, 'lxml')
+            soup = BeautifulSoup(page_text, 'lxml')
             page_text = soup.get_text(separator=" ", strip=True).lower()
             
             is_archived = "stoc epuizat" in page_text or "produs indisponibil" in page_text or "vandut" in page_text or "nu este pe stoc" in page_text
@@ -837,21 +859,6 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         "sold_listings": []
     }
     
-    # 1. EXTRACT DUAL BASELINES (NGC & Numista)
-    try:
-        ngc_url = NGCScraper.get_ngc_url(country, km_num)
-        if ngc_url:
-            output_payload["baselines"]["ngc"] = NGCScraper.extract_baselines(ngc_url, target_year)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [!] [NGC] Error occurred during NGC extraction: {str(e)}{Colors.RESET}")
-
-    try:
-        with requests.Session(impersonate="chrome110", timeout=15) as curl_session:
-            output_payload["baselines"]["numista"] = NumistaScraper.extract_baselines(search_query, target_year, curl_session)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [!] [NUMISTA] Error occurred during Numista extraction: {str(e)}{Colors.RESET}")
-
-    # 2. EXTRACT LIVE MARKET & SOLD ARCHIVE
     def normalize_market_grade(raw_grade: str) -> str:
         g = raw_grade.upper().strip()
         # Edge cases & Direct hits
@@ -888,140 +895,139 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         
         return "UNGRADED"
 
+    # 1. ORCHESTRATE THREAD POOL EXECUTION
+    def fetch_ngc() -> list:
+        try:
+            url = NGCScraper.get_ngc_url(country, km_num)
+            return NGCScraper.extract_baselines(url, target_year) if url else []
+        except Exception as e:
+            print(f"{Colors.RED}❌ [!] [NGC] Thread Error: {str(e)}{Colors.RESET}")
+            return []
 
+    def fetch_numista() -> list:
+        try:
+            return NumistaScraper.extract_baselines(search_query, target_year)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [!] [NUMISTA] Thread Error: {str(e)}{Colors.RESET}")
+            return []
 
-    try:
-        ngc_url = NGCScraper.get_ngc_url(country, km_num)
-        if ngc_url:
-            output_payload["baselines"]["ngc"] = NGCScraper.extract_baselines(ngc_url, target_year)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [!] [NGC] Error occurred during NGC extraction: {str(e)}{Colors.RESET}")
+    print(f"\n{Colors.BLUE}===================================================={Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  SPINNING UP ASYNCHRONOUS THREAD POOL ENGINE{Colors.RESET}")
+    print(f"{Colors.BLUE}===================================================={Colors.RESET}")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        f_ngc = executor.submit(fetch_ngc)
+        f_numista = executor.submit(fetch_numista)
+        f_mashops = executor.submit(MAShopsSource.fetch_active, search_query, target_year, country)
+        f_ebay_active = executor.submit(eBaySource.fetch_active, search_query, target_year, country)
+        f_ebay_sold = executor.submit(eBaySource.fetch_sold, search_query, target_year, country)
+        f_okazii_active = executor.submit(OkaziiSource.fetch_active, search_query, target_year, country)
+        f_okazii_sold = executor.submit(OkaziiSource.fetch_sold, search_query, target_year, country)
+        
+        output_payload["baselines"]["ngc"] = f_ngc.result()
+        output_payload["baselines"]["numista"] = f_numista.result()
+        mashops_data = f_mashops.result()
+        ebay_active_data = f_ebay_active.result()
+        ebay_sold_data = f_ebay_sold.result()
+        okazii_active_data = f_okazii_active.result()
+        okazii_sold_data = f_okazii_sold.result()
 
-    try:
-        px = ProxyNetwork.get_random_proxy()
-        with requests.Session(impersonate="chrome110", proxies=px, timeout=20) as curl_session:
-            output_payload["baselines"]["numista"] = NumistaScraper.extract_baselines(search_query, target_year, curl_session)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [!] [NUMISTA] Error occurred during Numista extraction: {str(e)}{Colors.RESET}")
+    combined_active = mashops_data + ebay_active_data + okazii_active_data
+    combined_sold = ebay_sold_data + okazii_sold_data
 
-    # 2. EXTRACT LIVE MARKET & SOLD ARCHIVE
-    try:
-        # MA-Shops often blocks Datacenter Proxies. We fetch using bare IP.
-        with requests.Session(impersonate="chrome110", timeout=30) as direct_session:
-            mashops_data = MAShopsSource.fetch_active(search_query, target_year, country, direct_session)
+    # 2. DEDUPLICATE ACTIVE LIQUIDITY
+    seen_ids = set()
+    seen_images = set()
+    dedup_active = []
+    
+    def score_english(t):
+        tl = t['info'].lower()
+        return 1 if any(w in tl for w in ['coin', 'romania ', 'silver']) else 2
+    
+    combined_active.sort(key=score_english)
+    
+    for item in combined_active:
+        id_str = item['item_url']
+        if 'ebay.' in id_str and '/itm/' in id_str:
+            match = re.search(r'/itm/(\d+)', id_str)
+            if match: id_str = 'ebay_' + match.group(1)
+        elif 'okazii.ro' in id_str:
+            match = re.search(r'-a(\d+)', id_str)
+            if match: id_str = 'okazii_' + match.group(1)
+        
+        img_hash = None
+        if 'ebayimg.com/images/g/' in item['image_url']:
+            img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
+            if img_match: img_hash = img_match.group(1)
+            
+        is_dup = False
+        if img_hash and img_hash in seen_images:
+            is_dup = True
+        if id_str in seen_ids:
+            is_dup = True
+            
+        if not is_dup:
+            seen_ids.add(id_str)
+            if img_hash: seen_images.add(img_hash)
+            dedup_active.append(item)
+            
+    for item in dedup_active: item['grade'] = normalize_market_grade(item['grade'])
+    output_payload["active_listings"] = sorted(dedup_active, key=lambda x: x['price_usd'])
+    
+    # 3. DEDUPLICATE SOLD LIQUIDITY
+    seen_ids_sold = set()
+    seen_images_sold = set()
+    dedup_sold = []
+    
+    combined_sold.sort(key=score_english)
+    
+    for item in combined_sold:
+        id_str = item['item_url']
+        if 'ebay.' in id_str and '/itm/' in id_str:
+            match = re.search(r'/itm/(\d+)', id_str)
+            if match: id_str = 'ebay_' + match.group(1)
+        elif 'okazii.ro' in id_str:
+            match = re.search(r'-a(\d+)', id_str)
+            if match: id_str = 'okazii_' + match.group(1)
+        
+        img_hash = None
+        if 'ebayimg.com/images/g/' in item['image_url']:
+            img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
+            if img_match: img_hash = img_match.group(1)
+        
+        is_dup = False
+        if img_hash and img_hash in seen_images_sold:
+            is_dup = True
+        if id_str in seen_ids_sold:
+            is_dup = True
+            
+        if not is_dup:
+            seen_ids_sold.add(id_str)
+            if img_hash: seen_images_sold.add(img_hash)
+            dedup_sold.append(item)
+            
+    for item in dedup_sold: item['grade'] = normalize_market_grade(item['grade'])
+    output_payload["sold_listings"] = sorted(dedup_sold, key=lambda x: x['price_usd'])
+    
+    # 4. METRICS CALCULATION
+    if dedup_active:
+        prices = [item["price_usd"] for item in dedup_active]
+        output_payload["metrics"]["active"] = {
+            "median": round(statistics.median(prices), 2),
+            "min": round(min(prices), 2),
+            "max": round(max(prices), 2),
+            "supply": len(dedup_active)
+        }
+    if dedup_sold:
+        prices = [item["price_usd"] for item in dedup_sold]
+        output_payload["metrics"]["sold"] = {
+            "median": round(statistics.median(prices), 2),
+            "min": round(min(prices), 2),
+            "max": round(max(prices), 2),
+            "supply": len(dedup_sold)
+        }
 
-        px = ProxyNetwork.get_random_proxy()
-        with requests.Session(impersonate="chrome110", proxies=px, timeout=30) as curl_session:
-            # Active (eBay & Okazii)
-            ebay_active = eBaySource.fetch_active(search_query, target_year, country, curl_session)
-            okazii_active = OkaziiSource.fetch_active(search_query, target_year, country, curl_session)
-            
-            combined_active = mashops_data + ebay_active + okazii_active
-            
-            # Deduplicate
-            seen_ids = set()
-            seen_images = set()
-            dedup_active = []
-            
-            # Sort combined_active so English titles are preferred
-            def score_english(t):
-                tl = t['info'].lower()
-                return 1 if any(w in tl for w in ['coin', 'romania ', 'silver']) else 2
-            
-            combined_active.sort(key=score_english)
-            
-            for item in combined_active:
-                id_str = item['item_url']
-                if 'ebay.' in id_str and '/itm/' in id_str:
-                    match = re.search(r'/itm/(\d+)', id_str)
-                    if match: id_str = 'ebay_' + match.group(1)
-                elif 'okazii.ro' in id_str:
-                    match = re.search(r'-a(\d+)', id_str)
-                    if match: id_str = 'okazii_' + match.group(1)
-                
-                img_hash = None
-                if 'ebayimg.com/images/g/' in item['image_url']:
-                    img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
-                    if img_match: img_hash = img_match.group(1)
-                    
-                is_dup = False
-                if img_hash and img_hash in seen_images:
-                    is_dup = True
-                if id_str in seen_ids:
-                    is_dup = True
-                    
-                if not is_dup:
-                    seen_ids.add(id_str)
-                    if img_hash: seen_images.add(img_hash)
-                    dedup_active.append(item)
-                    
-            combined_active = dedup_active
-            for item in combined_active: item['grade'] = normalize_market_grade(item['grade'])
-            output_payload["active_listings"] = sorted(combined_active, key=lambda x: x['price_usd'])
-            
-            # Sold
-            ebay_sold = eBaySource.fetch_sold(search_query, target_year, country, curl_session)
-            okazii_sold = OkaziiSource.fetch_sold(search_query, target_year, country, curl_session)
-
-            combined_sold = ebay_sold + okazii_sold
-            
-            # Deduplicate Sold
-            seen_ids_sold = set()
-            seen_images_sold = set()
-            dedup_sold = []
-            
-            combined_sold.sort(key=score_english)
-            
-            for item in combined_sold:
-                id_str = item['item_url']
-                if 'ebay.' in id_str and '/itm/' in id_str:
-                    match = re.search(r'/itm/(\d+)', id_str)
-                    if match: id_str = 'ebay_' + match.group(1)
-                elif 'okazii.ro' in id_str:
-                    match = re.search(r'-a(\d+)', id_str)
-                    if match: id_str = 'okazii_' + match.group(1)
-                
-                img_hash = None
-                if 'ebayimg.com/images/g/' in item['image_url']:
-                    img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
-                    if img_match: img_hash = img_match.group(1)
-                
-                is_dup = False
-                if img_hash and img_hash in seen_images_sold:
-                    is_dup = True
-                if id_str in seen_ids_sold:
-                    is_dup = True
-                    
-                if not is_dup:
-                    seen_ids_sold.add(id_str)
-                    if img_hash: seen_images_sold.add(img_hash)
-                    dedup_sold.append(item)
-                    
-            combined_sold = dedup_sold
-            for item in combined_sold: item['grade'] = normalize_market_grade(item['grade'])
-            output_payload["sold_listings"] = sorted(combined_sold, key=lambda x: x['price_usd'])
-            
-            # Metrics Calculation
-            if combined_active:
-                prices = [item["price_usd"] for item in combined_active]
-                output_payload["metrics"]["active"] = {
-                    "median": round(statistics.median(prices), 2),
-                    "min": round(min(prices), 2),
-                    "max": round(max(prices), 2),
-                    "supply": len(combined_active)
-                }
-            if combined_sold:
-                prices = [item["price_usd"] for item in combined_sold]
-                output_payload["metrics"]["sold"] = {
-                    "median": round(statistics.median(prices), 2),
-                    "min": round(min(prices), 2),
-                    "max": round(max(prices), 2),
-                    "supply": len(combined_sold)
-                }
-    except Exception as e:
-        print(f"{Colors.RED}❌ [!] Error occurred during retail extraction: {str(e)}{Colors.RESET}")
-         
-    # 3. COMPILE AND EXPORT
+    # 5. COMPILE AND EXPORT
     with open("market_data.json", "w", encoding="utf-8") as f:
         json.dump(output_payload, f, indent=4)
         
