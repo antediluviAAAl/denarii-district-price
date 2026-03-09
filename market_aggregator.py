@@ -40,6 +40,12 @@ class Config:
 class ProxyNetwork:
     @staticmethod
     def get_proxies() -> List[str]:
+        # Secure Cloud Fallback: Try Render Environment Variables First
+        env_proxies = os.environ.get("PROXY_LIST")
+        if env_proxies:
+            return [p.strip() for p in env_proxies.split(",") if p.strip()]
+            
+        # Local Desktop Fallback
         proxy_file = "proxies.txt"
         if os.path.exists(proxy_file):
             with open(proxy_file, "r", encoding="utf-8") as f:
