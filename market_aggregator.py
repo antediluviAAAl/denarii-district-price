@@ -662,8 +662,8 @@ class eBaySource(AbstractMarketSource):
     @classmethod
     def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000"
-        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Active Live Deals: {url}{Colors.RESET}")
+        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000&LH_BIN=1"
+        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Fixed-Price Deals: {url}{Colors.RESET}")
         return cls.run_ebay_search(url, query, target_year, country, "eBay (Active)")
 
 # ==========================================
