@@ -9,3 +9,7 @@ lxml>=5.1.0
 
 # Database (Supabase Cloud)
 supabase>=2.0.0
+
+# Scrapling
+scrapling>=0.4.2
+camoufox>=0.4.11
