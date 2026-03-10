@@ -5,6 +5,7 @@ import uvicorn
 import os
 import json
 import traceback
+from datetime import datetime, timezone
 from market_aggregator import orchestrate_market_scan
 
 # ==========================================
@@ -75,8 +76,8 @@ def run_and_store_scrape(country: str, km: str, year: str, nominal: str, coin_id
         if supabase:
             row = {
                 "coin_id": coin_id,
-                "payload": payload
-                # scraped_at is auto-filled by Supabase default: now()
+                "payload": payload,
+                "scraped_at": datetime.now(timezone.utc).isoformat()
             }
             supabase.table("d_price_analysis").upsert(row).execute()
             print(f"✅ [BACKGROUND] Successfully cached data for {coin_id} in Supabase.")
