@@ -74,7 +74,7 @@ def run_and_store_scrape(country: str, km: str, year: str, nominal: str, coin_id
         supabase = get_supabase_client()
         if supabase:
             row = {
-                "coid_id": coin_id,
+                "coin_id": coin_id,
                 "payload": payload
                 # scraped_at is auto-filled by Supabase default: now()
             }
