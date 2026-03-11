@@ -8,6 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Disable Camoufox version check to avoid GitHub API rate limits on Render
+ENV CAMOUFOX_SKIP_UPDATE_CHECK=1
+
 # 4. Install OS-level browser dependencies
 RUN apt-get update && \
     python -m patchright install && \
