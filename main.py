@@ -71,12 +71,17 @@ def run_and_store_scrape(country: str, km: str, year: str, nominal: str, coin_id
             nominal=nominal
         )
 
+        raw_payload = {
+            "active_listings": payload.pop("raw_active_listings", []),
+            "sold_listings": payload.pop("raw_sold_listings", [])
+        }
         # Push to Supabase
         supabase = get_supabase_client()
         if supabase:
             row = {
                 "coin_id": coin_id,
                 "payload": payload,
+                "raw_payload": raw_payload,
                 "scraped_at": datetime.now(timezone.utc).isoformat()
             }
             supabase.table("d_price_analysis").upsert(row).execute()

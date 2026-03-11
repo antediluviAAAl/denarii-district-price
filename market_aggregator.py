@@ -620,8 +620,11 @@ class MAShopsSource(AbstractMarketSource):
                     continue
 
             if usd_normalized > 0:
+                is_valid = True
+                rejection_reason = None
+                
                 if not cls.validate_integrity(info, str(target_year)):
-                    continue
+                    is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
                 parsed_listings.append({
                     "source": "MA-Shops",
                     "country": country_val,
@@ -631,7 +634,9 @@ class MAShopsSource(AbstractMarketSource):
                     "info": info,
                     "price_usd": round(usd_normalized, 2),
                     "item_url": item_url,
-                    "image_url": image_url
+                    "image_url": image_url,
+                    "is_valid":is_valid,
+                    "rejection_reason":rejection_reason
                 })
 
         return parsed_listings
@@ -720,10 +725,16 @@ class eBaySource(AbstractMarketSource):
             # Strict phrase match: "5 lei" must appear as a contiguous phrase, not scattered words
             if nominal not in title_lower:
                 continue
-                
-            if any(term in title_lower for term in cls.SLAB_TERMS): continue
-            if any(term in title_lower for term in cls.FAKE_TERMS): continue
-            if any(term in title_lower for term in cls.DAMAGE_TERMS): continue
+            
+            is_valid = True
+            rejection_reason = None
+            
+            if any(term in title_lower for term in cls.SLAB_TERMS):
+                is_valid, rejection_reason = False, "SLAB_TERM_DETECTED"
+            elif any(term in title_lower for term in cls.FAKE_TERMS):
+                is_valid, rejection_reason = False, "FAKE_TERM_DETECTED"
+            elif any(term in title_lower for term in cls.DAMAGE_TERMS):
+                is_valid, rejection_reason = False, "DAMAGE_TERM_DETECTED"
                 
             title = title.replace("New Listing", "").strip()
             price_str = price_el.get_text(strip=True)
@@ -748,8 +759,8 @@ class eBaySource(AbstractMarketSource):
                 date_str = date_match_int.group(0) if date_match_int else ("Active" if not 'Sold' in source_tag else "Recent")
 
             info_str = f"[{'SOLD' if 'Sold' in source_tag else 'RETAIL'}] " + title
-            if not cls.validate_integrity(info_str, str(target_year)):
-                continue
+            if is_valid and not cls.validate_integrity(info_str, str(target_year)):
+                is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
 
             parsed_listings.append({
                 "source": source_tag,
@@ -761,7 +772,9 @@ class eBaySource(AbstractMarketSource):
                 "price_usd": clean_price,
                 "item_url": url_href,
                 "image_url": image_url,
-                "date": date_str
+                "date": date_str,
+                "is_valid": is_valid,                     # <-- NEW
+                "rejection_reason": rejection_reason      # <-- NEW
             })
 
         return parsed_listings
@@ -876,8 +889,13 @@ class OkaziiSource(AbstractMarketSource):
             # Since DDG is returning limited results, if we are specifically fetching active, and the DDG search was for active (no "stoc epuizat"),
             # but the page says it's out of stock, we drop it. Conversely, if we want sold, and it IS out of stock, we keep it.
             # But the user mentioned it was wrongly classed. Let's force the label based on what it actually is, then append to the respective list.
-            if is_sold and not is_archived: continue
-            if not is_sold and is_archived: continue
+            is_valid = True
+            rejection_reason = None
+            
+            if is_sold and not is_archived: 
+                is_valid, rejection_reason = False, "EXPECTED_SOLD_GOT_ACTIVE"
+            elif not is_sold and is_archived: 
+                is_valid, rejection_reason = False, "EXPECTED_ACTIVE_GOT_SOLD"
                 
             title_el = soup.find('h1')
             title = title_el.get_text(strip=True) if title_el else "Unknown Title"
@@ -934,8 +952,8 @@ class OkaziiSource(AbstractMarketSource):
                     date_str = "Recent"
 
             info_str = f"[{'SOLD' if is_sold else 'RETAIL'}] " + title
-            if not cls.validate_integrity(info_str, str(target_year)):
-                continue
+            if is_valid and not cls.validate_integrity(info_str, str(target_year)):
+                is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
 
             results.append({
                 "source": "Okazii (Archive)" if is_sold else "Okazii",
@@ -947,7 +965,9 @@ class OkaziiSource(AbstractMarketSource):
                 "price_usd": round(normalized_usd, 2),
                 "item_url": link,
                 "image_url": image_url,
-                "date": date_str
+                "date": date_str,
+                "is_valid": is_valid,
+                "rejection_reason": rejection_reason
             })
             
         return results
@@ -1100,6 +1120,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     seen_ids = set()
     seen_images = set()
     dedup_active = []
+    output_payload["raw_active_listings"] = []
     
     def score_english(t):
         tl = t['info'].lower()
@@ -1108,29 +1129,38 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     combined_active.sort(key=score_english)
     
     for item in combined_active:
-        id_str = item['item_url']
-        if 'ebay.' in id_str and '/itm/' in id_str:
-            match = re.search(r'/itm/(\d+)', id_str)
-            if match: id_str = 'ebay_' + match.group(1)
-        elif 'okazii.ro' in id_str:
-            match = re.search(r'-a(\d+)', id_str)
-            if match: id_str = 'okazii_' + match.group(1)
-        
-        img_hash = None
-        if 'ebayimg.com/images/g/' in item['image_url']:
-            img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
-            if img_match: img_hash = img_match.group(1)
+        if not item.get("is_valid", True):
+            pass # Keep its existing scraper rejection reason
+        else:
+            id_str = item['item_url']
+            if 'ebay.' in id_str and '/itm/' in id_str:
+                match = re.search(r'/itm/(\d+)', id_str)
+                if match: id_str = 'ebay_' + match.group(1)
+            elif 'okazii.ro' in id_str:
+                match = re.search(r'-a(\d+)', id_str)
+                if match: id_str = 'okazii_' + match.group(1)
             
-        is_dup = False
-        if img_hash and img_hash in seen_images:
-            is_dup = True
-        if id_str in seen_ids:
-            is_dup = True
-            
-        if not is_dup:
-            seen_ids.add(id_str)
-            if img_hash: seen_images.add(img_hash)
-            dedup_active.append(item)
+            img_hash = None
+            if 'ebayimg.com/images/g/' in item['image_url']:
+                img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
+                if img_match: img_hash = img_match.group(1)
+                
+            is_dup = False
+            if img_hash and img_hash in seen_images:
+                is_dup = True
+            if id_str in seen_ids:
+                is_dup = True
+                
+            if is_dup:
+                item["is_valid"] = False
+                item["rejection_reason"] = "DUPLICATE_LISTING"
+            else:
+                seen_ids.add(id_str)
+                if img_hash: seen_images.add(img_hash)
+                dedup_active.append(item)
+                
+        # Append EVERY item (valid or rejected) to the raw list
+        output_payload["raw_active_listings"].append(item)
             
     for item in dedup_active: item['grade'] = normalize_market_grade(item['grade'])
     output_payload["active_listings"] = sorted(dedup_active, key=lambda x: x['price_usd'])
@@ -1139,33 +1169,43 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     seen_ids_sold = set()
     seen_images_sold = set()
     dedup_sold = []
+    output_payload["raw_sold_listings"] = []
     
     combined_sold.sort(key=score_english)
     
     for item in combined_sold:
-        id_str = item['item_url']
-        if 'ebay.' in id_str and '/itm/' in id_str:
-            match = re.search(r'/itm/(\d+)', id_str)
-            if match: id_str = 'ebay_' + match.group(1)
-        elif 'okazii.ro' in id_str:
-            match = re.search(r'-a(\d+)', id_str)
-            if match: id_str = 'okazii_' + match.group(1)
-        
-        img_hash = None
-        if 'ebayimg.com/images/g/' in item['image_url']:
-            img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
-            if img_match: img_hash = img_match.group(1)
-        
-        is_dup = False
-        if img_hash and img_hash in seen_images_sold:
-            is_dup = True
-        if id_str in seen_ids_sold:
-            is_dup = True
+        if not item.get("is_valid", True):
+            pass # Keep its existing scraper rejection reason
+        else:
+            id_str = item['item_url']
+            if 'ebay.' in id_str and '/itm/' in id_str:
+                match = re.search(r'/itm/(\d+)', id_str)
+                if match: id_str = 'ebay_' + match.group(1)
+            elif 'okazii.ro' in id_str:
+                match = re.search(r'-a(\d+)', id_str)
+                if match: id_str = 'okazii_' + match.group(1)
             
-        if not is_dup:
-            seen_ids_sold.add(id_str)
-            if img_hash: seen_images_sold.add(img_hash)
-            dedup_sold.append(item)
+            img_hash = None
+            if 'ebayimg.com/images/g/' in item['image_url']:
+                img_match = re.search(r'/images/g/([^/]+)/', item['image_url'])
+                if img_match: img_hash = img_match.group(1)
+            
+            is_dup = False
+            if img_hash and img_hash in seen_images_sold:
+                is_dup = True
+            if id_str in seen_ids_sold:
+                is_dup = True
+                
+            if is_dup:
+                item["is_valid"] = False
+                item["rejection_reason"] = "DUPLICATE_LISTING"
+            else:
+                seen_ids_sold.add(id_str)
+                if img_hash: seen_images_sold.add(img_hash)
+                dedup_sold.append(item)
+                
+        # Append EVERY item (valid or rejected) to the raw list
+        output_payload["raw_sold_listings"].append(item)
             
     for item in dedup_sold: item['grade'] = normalize_market_grade(item['grade'])
     output_payload["sold_listings"] = sorted(dedup_sold, key=lambda x: x['price_usd'])
@@ -1189,10 +1229,27 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         }
 
     # 5. COMPILE AND EXPORT
-    if os.environ.get("DEBUG_LOCAL"):
+    # We trigger this if DEBUG_LOCAL is set, OR if the file is run directly via CMD
+    if os.environ.get("DEBUG_LOCAL") or __name__ == "__main__":
+        # Safely extract the raw data without deleting it from the main payload
+        raw_payload = {
+            "active_listings": output_payload.get("raw_active_listings", []),
+            "sold_listings": output_payload.get("raw_sold_listings", [])
+        }
+        
+        # Create a clean version of the payload for the standard JSON file
+        clean_payload = {
+            k: v for k, v in output_payload.items() 
+            if k not in ["raw_active_listings", "raw_sold_listings"]
+        }
+
         with open("market_data.json", "w", encoding="utf-8") as f:
-            json.dump(output_payload, f, indent=4)
-        print(f"{Colors.GREEN}[+] Debug: output flushed to market_data.json{Colors.RESET}")
+            json.dump(clean_payload, f, indent=4)
+            
+        with open("raw_market_data.json", "w", encoding="utf-8") as f:
+            json.dump(raw_payload, f, indent=4)
+            
+        print(f"{Colors.GREEN}[+] Debug: output safely flushed to market_data.json and raw_market_data.json{Colors.RESET}")
         
     print(f"\n{Colors.BOLD}{Colors.HEADER}====================================================")
     print(f"             📦 MARKET MATRIX PACKAGED 📦")
