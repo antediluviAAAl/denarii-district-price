@@ -476,18 +476,42 @@ class NumistaAPIScraper:
 class AbstractMarketSource(ABC):
     @classmethod
     @abstractmethod
-    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         pass
         
     @classmethod
     @abstractmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+    def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         pass
 
     @classmethod
-    @abstractmethod
-    def validate_integrity(cls, title: str, target_year: str) -> bool:
-        pass
+    def validate_integrity(cls, title: str, target_year: str, extra_fake_terms: List[str] = []) -> bool:
+        """Universal validation: strictly verifies isolated target year and handles date ranges."""
+        t_lower = title.lower()
+        # 1. Year must appear as an isolated token
+        if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
+            return False
+            
+        # 2. Year Safety Check: Reject if ANOTHER year appears as an isolated token.
+        # We allow years if they look like part of a range (e.g. 1881-1914) or are in parentheses.
+        years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
+        for y in years_found:
+            if y != str(target_year):
+                # Is it part of a range? e.g. "1881-1914"
+                range_match = re.search(rf'{y}\s*-\s*\d+|\d+\s*-\s*{y}', t_lower)
+                # Is it in parentheses? e.g. "(1881)"
+                paren_match = re.search(rf'\({y}\)', t_lower)
+                
+                if not (range_match or paren_match):
+                    return False
+
+        # 3. Term-based Rejections (Base + Local)
+        base_fake = ['replica', 'copy', 'fake', 'reproduction', 'novelty', 'tribute', 'fantasy']
+        all_fake = list(set(base_fake + extra_fake_terms))
+        if any(fw in t_lower for fw in all_fake):
+            return False
+            
+        return True
 
 
 # ==========================================
@@ -495,17 +519,14 @@ class AbstractMarketSource(ABC):
 # ==========================================
 class MAShopsSource(AbstractMarketSource):
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+    def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         # MA-Shops does not expose public historical liquidity/sold deals out of the box
         return []
 
     @classmethod
-    def validate_integrity(cls, title: str, target_year: str) -> bool:
-        """High Trust bounds: Exclusively verifies target_year exists without arbitrary secondary bounding."""
-        t_lower = title.lower()
-        if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
-            return False
-        return True
+    def validate_integrity(cls, title: str, target_year: str, extra_fake_terms: List[str] = []) -> bool:
+        """Ma-Shops: Preserves High-Trust bounds while inheriting Smart Year range awareness."""
+        return super().validate_integrity(title, target_year, extra_fake_terms=extra_fake_terms)
 
     @staticmethod
     def get_headers():
@@ -521,7 +542,7 @@ class MAShopsSource(AbstractMarketSource):
         }
 
     @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         """Maps live retail table rows safely mapping Dual Layout A/B variants."""
         encoded_query = urllib.parse.quote_plus(query)
         search_url = f"{Config.MASHOPS_BASE_URL}?searchstr={encoded_query}&submitBtn=Search"
@@ -558,10 +579,20 @@ class MAShopsSource(AbstractMarketSource):
             if len(tds) >= 7:
                 # Layout A: 7-column table. Year column (tds[3]) contains reign range e.g. '1881-1914'.
                 country_val = tds[1].get_text(strip=True)
-                nominal = tds[2].get_text(strip=True)
+                item_nominal = tds[2].get_text(strip=True)
                 year = tds[3].get_text(strip=True)
+                
+                # Proper Chunking Validation
+                is_valid = True
+                rejection_reason = None
+                
                 if str(target_year) not in year:
-                    continue
+                    is_valid, rejection_reason = False, "YEAR_MISSING"
+                
+                if nominal.lower() not in item_nominal.lower():
+                    is_valid, rejection_reason = False, "NOMINAL_MISMATCH"
+                
+                if not is_valid: continue
 
                 info_td = tds[4]
                 for bad_tag in info_td.find_all(['span', 'b', 'strong'], class_=re.compile(r'newgold|bold', re.I)):
@@ -614,6 +645,8 @@ class MAShopsSource(AbstractMarketSource):
                         usd_normalized = val * Config.EUR_TO_USD
                     elif 'GBP' in cur_str or '£' in cur_str:
                         usd_normalized = val * Config.GBP_TO_USD
+                    elif 'RON' in cur_str:
+                        usd_normalized = val * Config.RON_TO_USD
                     else:
                         usd_normalized = val
                 except ValueError:
@@ -650,34 +683,10 @@ class eBaySource(AbstractMarketSource):
     DAMAGE_TERMS = ["cleaned", "holed", "scratched", "plugged", "bent", "environmental", "corroded"]
 
     @classmethod
-    def validate_integrity(cls, title: str, target_year: str) -> bool:
-        t_lower = title.lower()
-        # 1. Year must appear as an isolated token
-        if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
-            return False
-            
-        # 2. Year Safety Check: Reject if ANOTHER year appears as an isolated token.
-        # We allow years if they look like part of a range (e.g. 1881-1914) or are in parentheses.
-        # This prevents "1883" being matched in a "Carol I (1866-1914) 1881 5 Lei" title.
-        # Step A: Find all year-like strings
-        years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
-        for y in years_found:
-            # If we find a year that isn't our target, check if it's "safe"
-            if y != str(target_year):
-                # Is it part of a range? e.g. "1881-1914"
-                range_match = re.search(rf'{y}\s*-\s*\d+||\d+\s*-\s*{y}', t_lower)
-                # Is it in parentheses? e.g. "(1881)"
-                paren_match = re.search(rf'\({y}\)', t_lower)
-                
-                if not (range_match or paren_match):
-                    return False
-
-        # 3. Generic fake/replica filter
-        fake_keywords = ['fantasy', 'replica', 'copy', 'fake', 'novelty', 'tribute']
-        if any(fw in t_lower for fw in fake_keywords):
-            return False
-            
-        return True
+    def validate_integrity(cls, title: str, target_year: str, extra_fake_terms: List[str] = []) -> bool:
+        """eBay: Applies standard Smart Year Match plus eBay-specific replica filters."""
+        combined_fakes = list(set(cls.FAKE_TERMS + extra_fake_terms))
+        return super().validate_integrity(title, target_year, extra_fake_terms=combined_fakes)
 
     @staticmethod
     def extract_grade(title: str) -> str:
@@ -700,7 +709,7 @@ class eBaySource(AbstractMarketSource):
         return "UNGRADED"
 
     @classmethod
-    def run_ebay_search(cls, url: str, query: str, target_year: str, country: str, source_tag: str) -> List[Dict[str, Any]]:
+    def run_ebay_search(cls, url: str, query: str, target_year: str, country: str, nominal: str, source_tag: str) -> List[Dict[str, Any]]:
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
@@ -740,14 +749,20 @@ class eBaySource(AbstractMarketSource):
             if str(target_year) not in title:
                 is_valid, rejection_reason = False, "YEAR_MISSING"
             
-            # 2. Nominal Check (Word-based, non-contiguous)
-            # Split nominal into keywords (e.g. "Romania 5 lei" -> ["romania", "5", "lei"])
-            # Require all keywords to be present, but not necessarily in order.
-            nom_keywords = [k.lower() for k in query.replace(str(target_year), "").split() if k.strip()]
-            for kw in nom_keywords:
-                if kw not in title_lower:
-                    is_valid, rejection_reason = False, f"NOMINAL_KEYWORD_MISSING_{kw.upper()}"
-                    break
+            # 2. Proper Chunking Validation (Phrase-based Nominal + Keyword Country)
+            if is_valid:
+                # Match Nominal as a phrase
+                if nominal.lower() not in title_lower:
+                    is_valid, rejection_reason = False, f"NOMINAL_PHRASE_MISSING_{nominal.upper()}"
+                
+                # Match Country as keywords (to be flexible with 'Romania - Carol I')
+                country_keywords = [k.lower() for k in country.split() if len(k) > 2]
+                if country.lower() == "romania": 
+                    country_keywords.extend(["românia", "rumänien"])
+                    
+                has_country = any(kw in title_lower for kw in country_keywords)
+                if is_valid and not has_country:
+                    is_valid, rejection_reason = False, "COUNTRY_MISSING"
             
             # 3. Term-based Rejections
             if is_valid:
@@ -778,7 +793,6 @@ class eBaySource(AbstractMarketSource):
             date_str = date_match.group(0) if date_match else None
             
             if not date_str:
-                # Try international formats like 05-Mar-2024
                 date_match_int = re.search(r'\d{1,2}-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4}', item_text, re.IGNORECASE)
                 date_str = date_match_int.group(0) if date_match_int else ("Active" if not 'Sold' in source_tag else "Recent")
 
@@ -787,7 +801,7 @@ class eBaySource(AbstractMarketSource):
             parsed_listings.append({
                 "source": source_tag,
                 "country": country,
-                "nominal": query.replace(str(target_year), "").strip(),
+                "nominal": nominal,
                 "year": str(target_year),
                 "grade": grade,
                 "info": info_str,
@@ -795,47 +809,37 @@ class eBaySource(AbstractMarketSource):
                 "item_url": url_href,
                 "image_url": image_url,
                 "date": date_str,
-                "is_valid": is_valid,                     # <-- NEW
-                "rejection_reason": rejection_reason      # <-- NEW
+                "is_valid": is_valid,
+                "rejection_reason": rejection_reason
             })
 
         return parsed_listings
 
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
-        encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_Sold=1&LH_Complete=1"
-        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY SOLD] Querying Sold Liquidity Floor: {url}{Colors.RESET}")
-        return cls.run_ebay_search(url, query, target_year, country, "eBay (Sold)")
-
-    @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
+    def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000&LH_BIN=1"
         print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Fixed-Price Deals: {url}{Colors.RESET}")
-        return cls.run_ebay_search(url, query, target_year, country, "eBay (Active)")
+        return cls.run_ebay_search(url, query, target_year, country, nominal, "eBay (Active)")
+
+    @classmethod
+    def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
+        encoded_query = urllib.parse.quote_plus(query)
+        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_Sold=1&LH_Complete=1"
+        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY SOLD] Querying Sold Liquidity Floor: {url}{Colors.RESET}")
+        return cls.run_ebay_search(url, query, target_year, country, nominal, "eBay (Sold)")
 
 # ==========================================
 # PHASE 5: OKAZII ROMANIAN MARKET EXTRACTOR
 # ==========================================
 class OkaziiSource(AbstractMarketSource):
+    FAKE_TERMS = ['copie', 'replica', 'fals', 'fantezie']
+
     @classmethod
-    def validate_integrity(cls, title: str, target_year: str) -> bool:
-        t_lower = title.lower()
-        # 1. Year must appear as an isolated token
-        if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
-            return False
-        # 2. Romanian-language fake/replica filter
-        # 2. Romanian-language fake/replica filter
-        fake_keywords = ['copie', 'replica', 'fals', 'fantezie']
-        if any(fw in t_lower for fw in fake_keywords):
-            return False
-        # 3. Reject if any OTHER year appears in the title
-        years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
-        for y in years_found:
-            if y != str(target_year):
-                return False
-        return True
+    def validate_integrity(cls, title: str, target_year: str, extra_fake_terms: List[str] = []) -> bool:
+        """Okazii: Inherits Smart Year logic with Romanian fake terms."""
+        combined_fakes = list(set(cls.FAKE_TERMS + extra_fake_terms))
+        return super().validate_integrity(title, target_year, extra_fake_terms=combined_fakes)
 
     @staticmethod
     def get_headers():
@@ -881,15 +885,15 @@ class OkaziiSource(AbstractMarketSource):
         return list(dict.fromkeys(raw_matches))[:10]
 
     @classmethod
-    def fetch_active(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, False)
+    def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
+        return cls._fetch_listings(query, target_year, country, nominal, False)
 
     @classmethod
-    def fetch_sold(cls, query: str, target_year: str, country: str) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, True)
+    def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
+        return cls._fetch_listings(query, target_year, country, nominal, True)
 
     @classmethod
-    def _fetch_listings(cls, query: str, target_year: str, country: str, is_sold: bool) -> List[Dict[str, Any]]:
+    def _fetch_listings(cls, query: str, target_year: str, country: str, nominal: str, is_sold: bool) -> List[Dict[str, Any]]:
         mode_str = "SOLD" if is_sold else "ACTIVE"
         print(f"{Colors.CYAN}🌐 [NETWORK] [OKAZII {mode_str}] Querying Discovery Proxy for Romanian Listings...{Colors.RESET}")
         
@@ -952,7 +956,7 @@ class OkaziiSource(AbstractMarketSource):
                     
             if raw_price == 0.0: continue
             
-            normalized_usd = raw_price / 4.85 if currency == "RON" else raw_price * Config.EUR_TO_USD
+            normalized_usd = raw_price * Config.RON_TO_USD if currency == "RON" else raw_price * Config.EUR_TO_USD
             
             # Extract Image
             img_el = soup.select_one('#main-image-placeholder img, .gallery-top-wrapper img')
@@ -973,14 +977,28 @@ class OkaziiSource(AbstractMarketSource):
                 else:
                     date_str = "Recent"
 
-            info_str = f"[{'SOLD' if is_sold else 'RETAIL'}] " + title
-            if is_valid and not cls.validate_integrity(info_str, str(target_year)):
-                is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
+            # Proper Chunking Validation
+            is_valid = True
+            rejection_reason = None
+            title_lower = title.lower()
+            
+            if str(target_year) not in title:
+                is_valid, rejection_reason = False, "YEAR_MISSING"
+                
+            if nominal.lower() not in title_lower:
+                is_valid, rejection_reason = False, f"NOMINAL_PHRASE_MISSING_{nominal.upper()}"
+            
+            # Country Check for Okazii (mostly Romanian, so include variants)
+            country_keywords = [k.lower() for k in country.split() if len(k) > 2]
+            if country.lower() == "romania": country_keywords.extend(["românia", "rumänien"])
+            if not any(kw in title_lower for kw in country_keywords):
+                is_valid, rejection_reason = False, "COUNTRY_MISSING"
 
+            info_str = f"[{'SOLD' if is_sold else 'RETAIL'}] " + title
             results.append({
                 "source": "Okazii (Archive)" if is_sold else "Okazii",
                 "country": country,
-                "nominal": query.replace(str(target_year), "").strip(),
+                "nominal": nominal,
                 "year": str(target_year),
                 "grade": grade,
                 "info": info_str,
@@ -1006,9 +1024,11 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         clean_nominal = re.sub(r'^(Coin|Moneda|Monedă)[\s\-]*', '', clean_nominal, flags=re.IGNORECASE).strip()
     
     # search_query used for broad web searches (eBay, DDG, etc.)
-    search_query = f"{nominal} {target_year}"
-    # Use clean nominal if drastically different (shorter) for precise matching tools
-    match_nominal = clean_nominal if len(clean_nominal) < len(nominal) else nominal
+    # We now enforce: Country + Clean Nominal + Year
+    search_query = f"{country} {clean_nominal} {target_year}"
+    
+    # match_nominal used for precise matching tools (Numista)
+    match_nominal = clean_nominal
     
     output_payload = {
         "metadata": {
@@ -1026,7 +1046,9 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
             "sold": {}
         },
         "active_listings": [],
-        "sold_listings": []
+        "sold_listings": [],
+        "raw_active_listings": [],
+        "raw_sold_listings": []
     }
     
     def normalize_market_grade(raw_grade: str) -> str:
@@ -1098,7 +1120,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 3 — MA-SHOPS ACTIVE LISTINGS
     print(f"\n{Colors.BOLD}[STEP 3/7] MA-Shops Live Retail{Colors.RESET}")
     try:
-        mashops_data = MAShopsSource.fetch_active(search_query, target_year, country)
+        mashops_data = MAShopsSource.fetch_active(search_query, target_year, country, clean_nominal)
     except Exception as e:
         print(f"{Colors.RED}❌ [MA-SHOPS] Failed: {e}{Colors.RESET}")
         mashops_data = []
@@ -1106,7 +1128,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 4 — EBAY ACTIVE LISTINGS
     print(f"\n{Colors.BOLD}[STEP 4/7] eBay Active Listings{Colors.RESET}")
     try:
-        ebay_active_data = eBaySource.fetch_active(search_query, target_year, country)
+        ebay_active_data = eBaySource.fetch_active(search_query, target_year, country, clean_nominal)
     except Exception as e:
         print(f"{Colors.RED}❌ [EBAY ACTIVE] Failed: {e}{Colors.RESET}")
         ebay_active_data = []
@@ -1114,7 +1136,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 5 — EBAY SOLD LISTINGS
     print(f"\n{Colors.BOLD}[STEP 5/7] eBay Sold Listings{Colors.RESET}")
     try:
-        ebay_sold_data = eBaySource.fetch_sold(search_query, target_year, country)
+        ebay_sold_data = eBaySource.fetch_sold(search_query, target_year, country, clean_nominal)
     except Exception as e:
         print(f"{Colors.RED}❌ [EBAY SOLD] Failed: {e}{Colors.RESET}")
         ebay_sold_data = []
@@ -1122,7 +1144,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 6 — OKAZII ACTIVE LISTINGS
     print(f"\n{Colors.BOLD}[STEP 6/7] Okazii Active Listings{Colors.RESET}")
     try:
-        okazii_active_data = OkaziiSource.fetch_active(search_query, target_year, country)
+        okazii_active_data = OkaziiSource.fetch_active(search_query, target_year, country, clean_nominal)
     except Exception as e:
         print(f"{Colors.RED}❌ [OKAZII ACTIVE] Failed: {e}{Colors.RESET}")
         okazii_active_data = []
@@ -1130,7 +1152,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 7 — OKAZII SOLD LISTINGS
     print(f"\n{Colors.BOLD}[STEP 7/7] Okazii Sold (Archive){Colors.RESET}")
     try:
-        okazii_sold_data = OkaziiSource.fetch_sold(search_query, target_year, country)
+        okazii_sold_data = OkaziiSource.fetch_sold(search_query, target_year, country, clean_nominal)
     except Exception as e:
         print(f"{Colors.RED}❌ [OKAZII SOLD] Failed: {e}{Colors.RESET}")
         okazii_sold_data = []
