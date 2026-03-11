@@ -11,5 +11,6 @@ lxml>=5.1.0
 supabase>=2.0.0
 
 # Stealth Scraping (NGC Bypass)
+patchright>=1.47.0
 scrapling>=0.4.2
 camoufox>=0.4.11
