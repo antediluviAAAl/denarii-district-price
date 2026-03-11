@@ -10,11 +10,16 @@ from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+_SCRAPLING_OK = False
+_SCRAPLING_ERR = "Not attempted"
+
 try:
     from scrapling.fetchers import StealthyFetcher as _StealthyFetcher
     _SCRAPLING_OK = True
-except ImportError:
+    _SCRAPLING_ERR = None
+except Exception as e:
     _SCRAPLING_OK = False
+    _SCRAPLING_ERR = str(e)
 
 # Load .env file if present (local dev)
 try:
@@ -220,7 +225,7 @@ class NGCScraper:
                 except Exception as e:
                     print(f"{Colors.YELLOW}⚠️  [NGC] StealthyFetcher failed on {proxy.split('@')[-1]}: {e}{Colors.RESET}")
         elif not _SCRAPLING_OK:
-            print(f"{Colors.YELLOW}⚠️  [NGC] Scrapling not installed — falling back to smart_fetch (likely to be blocked){Colors.RESET}")
+            print(f"{Colors.YELLOW}⚠️  [NGC] Scrapling not available (Error: {_SCRAPLING_ERR}) — falling back to smart_fetch{Colors.RESET}")
             headers = {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
