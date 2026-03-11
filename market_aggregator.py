@@ -655,16 +655,28 @@ class eBaySource(AbstractMarketSource):
         # 1. Year must appear as an isolated token
         if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
             return False
-        # 2. Generic fake/replica filter
+            
+        # 2. Year Safety Check: Reject if ANOTHER year appears as an isolated token.
+        # We allow years if they look like part of a range (e.g. 1881-1914) or are in parentheses.
+        # This prevents "1883" being matched in a "Carol I (1866-1914) 1881 5 Lei" title.
+        # Step A: Find all year-like strings
+        years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
+        for y in years_found:
+            # If we find a year that isn't our target, check if it's "safe"
+            if y != str(target_year):
+                # Is it part of a range? e.g. "1881-1914"
+                range_match = re.search(rf'{y}\s*-\s*\d+||\d+\s*-\s*{y}', t_lower)
+                # Is it in parentheses? e.g. "(1881)"
+                paren_match = re.search(rf'\({y}\)', t_lower)
+                
+                if not (range_match or paren_match):
+                    return False
+
+        # 3. Generic fake/replica filter
         fake_keywords = ['fantasy', 'replica', 'copy', 'fake', 'novelty', 'tribute']
         if any(fw in t_lower for fw in fake_keywords):
             return False
-        # 3. Reject if any OTHER year appears in the title (catches wrong-year listings
-        #    e.g. "5 Lei 1880 Carol I (1866-1881)" when searching for 1881)
-        years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
-        for y in years_found:
-            if y != str(target_year):
-                return False
+            
         return True
 
     @staticmethod
@@ -719,22 +731,34 @@ class eBaySource(AbstractMarketSource):
             title_lower = title.lower()
             
             if title_lower in ["shop on ebay", "new listing"]: continue
-            if str(target_year) not in title: continue
             
-            nominal = query.replace(str(target_year), "").strip().lower()
-            # Strict phrase match: "5 lei" must appear as a contiguous phrase, not scattered words
-            if nominal not in title_lower:
-                continue
-            
+            # --- VALIDATION BLOCK ---
             is_valid = True
             rejection_reason = None
             
-            if any(term in title_lower for term in cls.SLAB_TERMS):
-                is_valid, rejection_reason = False, "SLAB_TERM_DETECTED"
-            elif any(term in title_lower for term in cls.FAKE_TERMS):
-                is_valid, rejection_reason = False, "FAKE_TERM_DETECTED"
-            elif any(term in title_lower for term in cls.DAMAGE_TERMS):
-                is_valid, rejection_reason = False, "DAMAGE_TERM_DETECTED"
+            # 1. Strict Year Check
+            if str(target_year) not in title:
+                is_valid, rejection_reason = False, "YEAR_MISSING"
+            
+            # 2. Nominal Check (Word-based, non-contiguous)
+            # Split nominal into keywords (e.g. "Romania 5 lei" -> ["romania", "5", "lei"])
+            # Require all keywords to be present, but not necessarily in order.
+            nom_keywords = [k.lower() for k in query.replace(str(target_year), "").split() if k.strip()]
+            for kw in nom_keywords:
+                if kw not in title_lower:
+                    is_valid, rejection_reason = False, f"NOMINAL_KEYWORD_MISSING_{kw.upper()}"
+                    break
+            
+            # 3. Term-based Rejections
+            if is_valid:
+                if any(term in title_lower for term in cls.SLAB_TERMS):
+                    is_valid, rejection_reason = False, "SLAB_TERM_DETECTED"
+                elif any(term in title_lower for term in cls.FAKE_TERMS):
+                    is_valid, rejection_reason = False, "FAKE_TERM_DETECTED"
+                elif any(term in title_lower for term in cls.DAMAGE_TERMS):
+                    is_valid, rejection_reason = False, "DAMAGE_TERM_DETECTED"
+                elif not cls.validate_integrity(title, str(target_year)):
+                    is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
                 
             title = title.replace("New Listing", "").strip()
             price_str = price_el.get_text(strip=True)
@@ -759,8 +783,6 @@ class eBaySource(AbstractMarketSource):
                 date_str = date_match_int.group(0) if date_match_int else ("Active" if not 'Sold' in source_tag else "Recent")
 
             info_str = f"[{'SOLD' if 'Sold' in source_tag else 'RETAIL'}] " + title
-            if is_valid and not cls.validate_integrity(info_str, str(target_year)):
-                is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
 
             parsed_listings.append({
                 "source": source_tag,
