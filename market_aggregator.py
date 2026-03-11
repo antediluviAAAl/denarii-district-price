@@ -57,9 +57,15 @@ if hasattr(sys.stdout, 'reconfigure'):
 # ==========================================
 # FX RATES: FETCHED LIVE ON STARTUP
 # ==========================================
+_CACHED_FX = None
+
 def fetch_fx_rates() -> dict:
-    """Fetch live USD-based FX rates from fawazahmed0/exchange-api (no key, daily updates).
-    Falls back to hardcoded safe defaults on any failure."""
+    """Fetch live USD-based FX rates from fawazahmed0/exchange-api.
+    Caches the result in memory so it only runs once per server lifecycle."""
+    global _CACHED_FX
+    if _CACHED_FX is not None:
+        return _CACHED_FX
+        
     _DEFAULTS = {'eur': 1.08, 'gbp': 1.26, 'ron': 1 / 4.65}
     try:
         cdn = 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json'
@@ -70,11 +76,14 @@ def fetch_fx_rates() -> dict:
         eur = 1 / rates['eur'] if rates.get('eur') else _DEFAULTS['eur']
         gbp = 1 / rates['gbp'] if rates.get('gbp') else _DEFAULTS['gbp']
         ron = 1 / rates['ron'] if rates.get('ron') else _DEFAULTS['ron']
-        print(f"{Colors.GREEN}[FX] Live rates fetched: 1 EUR = ${eur:.4f} | 1 GBP = ${gbp:.4f} | 1 RON = ${ron:.4f}{Colors.RESET}")
-        return {'eur': round(eur, 6), 'gbp': round(gbp, 6), 'ron': round(ron, 6)}
+        
+        _CACHED_FX = {'eur': round(eur, 6), 'gbp': round(gbp, 6), 'ron': round(ron, 6)}
+        print(f"{Colors.GREEN}[FX] Live rates fetched & cached: 1 EUR = ${_CACHED_FX['eur']:.4f} | 1 RON = ${_CACHED_FX['ron']:.4f}{Colors.RESET}")
+        return _CACHED_FX
     except Exception as ex:
-        print(f"{Colors.YELLOW}⚠️  [FX] Live rate fetch failed ({ex}). Using hardcoded fallback rates.{Colors.RESET}")
-        return _DEFAULTS
+        print(f"{Colors.YELLOW}⚠️  [FX] Live rate fetch failed ({ex}). Using defaults.{Colors.RESET}")
+        _CACHED_FX = _DEFAULTS
+        return _CACHED_FX
 
 class Config:
     NGC_BASE_URL = "https://www.ngccoin.com/price-guide/world"
@@ -115,7 +124,7 @@ def smart_fetch(url: str, headers: dict = None, expected_texts: list = None, ret
     for attempt in range(1, retry_limit + 1):
         proxy_dict = ProxyNetwork.get_random_proxy()
         proxy_ip = proxy_dict['http'].split('@')[-1] if proxy_dict else "Local IP"
-        timeout_val = 15 if attempt == 1 else 25
+        timeout_val = 5 if attempt == 1 else 8
         
         try:
             with requests.Session(impersonate="chrome110", proxies=proxy_dict, timeout=timeout_val) as session:
