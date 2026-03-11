@@ -9,7 +9,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 4. Install OS-level browser dependencies
-# Running as root in Docker allows 'install-deps' to use apt-get successfully
 RUN apt-get update && \
     python -m patchright install && \
     python -m patchright install-deps && \
@@ -18,5 +17,8 @@ RUN apt-get update && \
 # 5. Copy the rest of your application code
 COPY . .
 
-# 6. Start the FastAPI server using your existing programmatic entry point
-CMD ["python", "main.py"]
+# 6. EXPOSE the port Render uses
+EXPOSE 10000
+
+# 7. Start the FastAPI server directly via Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
