@@ -3,13 +3,36 @@ import json
 import re
 import statistics
 import urllib.parse
+import urllib.request
 import os
 import random
 from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
-import concurrent.futures
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+_SCRAPLING_OK = False
+_SCRAPLING_ERR = "Not attempted"
+
+try:
+    from scrapling.fetchers import StealthyFetcher as _StealthyFetcher
+    _SCRAPLING_OK = True
+    _SCRAPLING_ERR = None
+except Exception as e:
+    _SCRAPLING_OK = False
+    _SCRAPLING_ERR = str(e)
+
+# Load .env file if present (local dev)
+try:
+    _env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(_env_path):
+        with open(_env_path, encoding='utf-8') as _ef:
+            for _line in _ef:
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _v = _line.split('=', 1)
+                    os.environ.setdefault(_k.strip(), _v.strip())
+except Exception:
+    pass
 
 # ==========================================
 # TERMINAL UI: ANSI COLOR CODES
@@ -31,11 +54,38 @@ if hasattr(sys.stdout, 'reconfigure'):
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# ==========================================
+# FX RATES: FETCHED LIVE ON STARTUP
+# ==========================================
+def fetch_fx_rates() -> dict:
+    """Fetch live USD-based FX rates from fawazahmed0/exchange-api (no key, daily updates).
+    Falls back to hardcoded safe defaults on any failure."""
+    _DEFAULTS = {'eur': 1.08, 'gbp': 1.26, 'ron': 1 / 4.65}
+    try:
+        cdn = 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json'
+        req = urllib.request.Request(cdn, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        rates = data.get('usd', {})
+        eur = 1 / rates['eur'] if rates.get('eur') else _DEFAULTS['eur']
+        gbp = 1 / rates['gbp'] if rates.get('gbp') else _DEFAULTS['gbp']
+        ron = 1 / rates['ron'] if rates.get('ron') else _DEFAULTS['ron']
+        print(f"{Colors.GREEN}[FX] Live rates fetched: 1 EUR = ${eur:.4f} | 1 GBP = ${gbp:.4f} | 1 RON = ${ron:.4f}{Colors.RESET}")
+        return {'eur': round(eur, 6), 'gbp': round(gbp, 6), 'ron': round(ron, 6)}
+    except Exception as ex:
+        print(f"{Colors.YELLOW}⚠️  [FX] Live rate fetch failed ({ex}). Using hardcoded fallback rates.{Colors.RESET}")
+        return _DEFAULTS
+
 class Config:
     NGC_BASE_URL = "https://www.ngccoin.com/price-guide/world"
     MASHOPS_BASE_URL = "https://www.ma-shops.com/shops/search.php"
-    EUR_TO_USD = 1.08
-    GBP_TO_USD = 1.26
+    # Populated dynamically at startup by fetch_fx_rates()
+    EUR_TO_USD: float = 1.08
+    GBP_TO_USD: float = 1.26
+    RON_TO_USD: float = 1 / 4.65
+
+# ---- NUMISTA API KEY ----
+NUMISTA_API_KEY = os.environ.get("NUMISTA_API_KEY", "")
 
 class ProxyNetwork:
     @staticmethod
@@ -109,7 +159,9 @@ class NGCScraper:
     @classmethod
     def get_ngc_url(cls, country: str, km_num: str) -> Optional[str]:
         """Uses DuckDuckGo HTML to inherently bypass ALL GDPR cookie walls and WAF blocks."""
-        proxy_query = f'site:ngccoin.com/price-guide/world "{country}" "KM {km_num}"'
+        # Strip any KM# / KM prefix so query reads 'KM 17.1' not 'KM KM# 17.1'
+        clean_km = km_num.upper().replace('KM#', '').replace('KM', '').strip()
+        proxy_query = f'site:ngccoin.com/price-guide/world "{country}" "KM {clean_km}"'
         encoded_query = urllib.parse.quote_plus(proxy_query)
         search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
         
@@ -143,26 +195,55 @@ class NGCScraper:
 
     @classmethod
     def extract_baselines(cls, url: str, target_year: str) -> List[Dict[str, Any]]:
-        """Extracts numerical numismatic valuations (baseline values) strictly from the HTML using headless datacenter proxy rotation."""
-        print(f"{Colors.BLUE}🌐 [~] [NGC] Network: Harvesting Official Data Matrix...{Colors.RESET}")
-        
+        """Extracts NGC price baselines using StealthyFetcher (Camoufox hardened Firefox)
+        which can bypass Cloudflare Turnstile. Falls back to smart_fetch if Scrapling
+        is not installed."""
+        print(f"{Colors.BLUE}🌐 [~] [NGC] Network: Harvesting Official Data Matrix via StealthyFetcher...{Colors.RESET}")
+
         proxies = ProxyNetwork.get_proxies()
-        if not proxies:
-            print(f"{Colors.YELLOW}⚠️  [!] [NGC] NO PROXIES CONFIGURED in proxies.txt. Attempting bare connection (high risk).{Colors.RESET}")
-            proxies = [None]
-            
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/",
-            "Upgrade-Insecure-Requests": "1"
-        }
-        
-        page_text = smart_fetch(url, headers=headers, expected_texts=["value", "5 francs", "mintage", "uxpricetablefixedcolumns_dxmaintable"], retry_limit=10, label="NGC")
-                
+        page_text = None
+
+        if _SCRAPLING_OK and proxies:
+            # Rotate through proxies until one succeeds
+            proxy_pool = proxies.copy()
+            random.shuffle(proxy_pool)
+            for proxy in proxy_pool:
+                try:
+                    print(f"{Colors.CYAN}🥷 [NGC] StealthyFetcher attempt via proxy {proxy.split('@')[-1]}...{Colors.RESET}")
+                    resp = _StealthyFetcher.fetch(url, headless=True, timeout=45000, proxy=proxy)
+                    if resp and resp.status == 200:
+                        html = getattr(resp, 'html_content', None) or ""
+                        if html and len(html) > 5000:  # real page, not an error stub
+                            page_text = html
+                            print(f"{Colors.GREEN}✅ [+] [NGC] StealthyFetcher bypassed Turnstile via {proxy.split('@')[-1]}{Colors.RESET}")
+                            break
+                        else:
+                            print(f"{Colors.YELLOW}⚠️  [NGC] Got 200 but body too small ({len(html)} bytes), rotating...{Colors.RESET}")
+                    else:
+                        status = getattr(resp, 'status', '?') if resp else 'None'
+                        print(f"{Colors.YELLOW}⚠️  [NGC] StealthyFetcher got status {status} via {proxy.split('@')[-1]}, rotating...{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.YELLOW}⚠️  [NGC] StealthyFetcher failed on {proxy.split('@')[-1]}: {e}{Colors.RESET}")
+        elif not _SCRAPLING_OK:
+            print(f"{Colors.YELLOW}⚠️  [NGC] Scrapling not available (Error: {_SCRAPLING_ERR}) — falling back to smart_fetch{Colors.RESET}")
+            headers = {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/",
+            }
+            page_text = smart_fetch(url, headers=headers, retry_limit=5, label="NGC")
+        else:
+            print(f"{Colors.YELLOW}⚠️  [!] [NGC] No proxies configured — bare StealthyFetcher attempt{Colors.RESET}")
+            try:
+                resp = _StealthyFetcher.fetch(url, headless=True, timeout=45000)
+                if resp and resp.status == 200:
+                    page_text = getattr(resp, 'html_content', None) or ""
+            except Exception as e:
+                print(f"{Colors.RED}❌ [NGC] Bare StealthyFetcher failed: {e}{Colors.RESET}")
+
         if not page_text:
-             print(f"{Colors.RED}⛔ [!] [NGC] Cloudflare Turnstile explicitly blocked requests or proxy failed.{Colors.RESET}")
-             return []
+            print(f"{Colors.RED}⛔ [!] [NGC] All fetch attempts failed — Cloudflare Turnstile or proxy exhausted.{Colors.RESET}")
+            return []
              
         soup = BeautifulSoup(page_text, 'html.parser')
         
@@ -236,129 +317,149 @@ class NGCScraper:
         return variants_list
 
 # ==========================================
-# PHASE 2: NUMISTA CATALOG BASELINE EXTRACTOR
+# PHASE 2: NUMISTA API v3 BASELINE EXTRACTOR
 # ==========================================
-class NumistaScraper:
-    BASE_URL = "https://en.numista.com"
+class NumistaAPIScraper:
+    """Uses the official Numista REST API v3 for reliable, structured baseline data.
+    Requires NUMISTA_API_KEY environment variable.
+    Flow: search types by query -> match best type_id -> list issues for target_year
+          -> fetch prices per issue -> map to unified grade schema.
+    """
+    API_BASE = "https://api.numista.com/api/v3"
 
-    @staticmethod
-    def get_headers():
-        return {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "accept-language": "en-US,en;q=0.9",
-            "sec-ch-ua": "\"Chromium\";v=\"110\", \"Google Chrome\";v=\"110\"",
-            "sec-ch-ua-platform": "\"Windows\"",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "upgrade-insecure-requests": "1",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-        }
+    # Numista grade labels -> our canonical grade keys
+    GRADE_MAP = {
+        'poor': 'PrAg', 'ag': 'PrAg', 'prag': 'PrAg',
+        'g': 'G', 'good': 'G',
+        'vg': 'VG', 'very good': 'VG',
+        'f': 'F', 'fine': 'F',
+        'vf': 'VF', 'very fine': 'VF',
+        'xf': 'XF', 'ef': 'XF', 'extremely fine': 'XF',
+        'au': 'AU', 'about uncirculated': 'AU',
+        'unc': 'UNC', 'ms': 'UNC', 'bu': 'UNC', 'uncirculated': 'UNC',
+    }
 
     @classmethod
-    def find_numista_url_via_proxy(cls, query):
-        proxy_query = f"{query} numista"
-        encoded_query = urllib.parse.quote_plus(proxy_query)
-        search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        
-        print(f"{Colors.CYAN}🔍 [*] [NUMISTA] Querying Discovery Proxy (DuckDuckGo): {proxy_query}{Colors.RESET}")
-        
-        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="NUMISTA DISCOVERY")
-        if not page_text:
+    def _api_get(cls, path: str, params: dict = None) -> Optional[dict]:
+        """Makes an authenticated GET to the Numista API. Returns parsed JSON or None."""
+        if not NUMISTA_API_KEY:
+            print(f"{Colors.RED}❌ [NUMISTA API] NUMISTA_API_KEY is not set. Skipping.{Colors.RESET}")
+            return None
+        url = f"{cls.API_BASE}{path}"
+        if params:
+            url += '?' + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={'Numista-API-Key': NUMISTA_API_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠️  [NUMISTA API] Request failed for {path}: {e}{Colors.RESET}")
+            return None
+
+    @classmethod
+    def _find_type_id(cls, query: str, nominal: str) -> Optional[int]:
+        """Searches Numista for the coin type and returns the best matching type_id."""
+        # Query often includes country+nominal+year. Nominal is the 'clean' version (e.g. '5 Lei').
+        data = cls._api_get('/types', {'q': query, 'lang': 'en'})
+        if not data:
+            return None
+        types = data.get('types', [])
+        if not types:
+            print(f"{Colors.YELLOW}👻 [NUMISTA API] No types found for query '{query}'.{Colors.RESET}")
             return None
             
-        decoded_html = urllib.parse.unquote(page_text)
-        numista_pattern = r'https://en\.numista\.com/(?:catalogue/pieces\d+\.html|\d+)'
-        matches = re.findall(numista_pattern, decoded_html)
-        
-        if matches:
-            print(f"{Colors.GREEN}🎯 [+] [NUMISTA] Discovered Target Catalog URL: {matches[0]}{Colors.RESET}")
-            return matches[0]
-        return None
+        # 1. High confidence: Title contains both nominal value AND country
+        # (This is the most reliable match for coins like '5 Lei')
+        for t in types:
+            title = t.get('title', '').lower()
+            if nominal.lower() in title:
+                print(f"{Colors.GREEN}✅ [NUMISTA API] Matched type: {t['title']} (ID: {t['id']}){Colors.RESET}")
+                return t['id']
+                
+        # 2. Fallback: Title contains nominal value
+        for t in types:
+            if nominal.lower() in t.get('title', '').lower():
+                return t['id']
+                
+        # 3. Last resort: trust first result if it seems related
+        print(f"{Colors.YELLOW}⚠️  [NUMISTA API] No strict nominal match within results. Using first result: {types[0]['title']}{Colors.RESET}")
+        return types[0]['id']
 
     @classmethod
-    def extract_baselines(cls, query: str, target_year: str) -> List[Dict[str, Any]]:
-        print(f"{Colors.BLUE}🌐 [~] [NUMISTA] Network: Harvesting Secondary Data Matrix...{Colors.RESET}")
-        
-        coin_url = cls.find_numista_url_via_proxy(query)
-        if not coin_url:
-            print(f"{Colors.YELLOW}👻 [-] [NUMISTA] Target query '{query}' not found via proxy.{Colors.RESET}")
-            return []
-            
-        page_text = smart_fetch(coin_url, headers=cls.get_headers(), retry_limit=10, label="NUMISTA")
-        if not page_text:
-            print(f"{Colors.YELLOW}⚠️  [!] [NUMISTA] Failed to access catalog page directly.{Colors.RESET}")
+    def _map_prices(cls, prices_data: dict) -> dict:
+        """Maps Numista API price records to our unified grade schema.
+        API response format: {"currency": "EUR", "prices": [{"grade": "vf", "price": 146.24}, ...]}
+        """
+        matrix = {'PrAg': None, 'G': None, 'VG': None, 'F': None,
+                  'VF': None, 'XF': None, 'AU': None, 'UNC': None}
+        currency = prices_data.get('currency', 'USD').upper()
+        for entry in prices_data.get('prices', []):
+            # Actual API field names are 'grade' (short code) and 'price' (numeric value)
+            raw_grade = entry.get('grade', '').lower().strip()
+            canonical = cls.GRADE_MAP.get(raw_grade)
+            if not canonical:
+                for k, v in cls.GRADE_MAP.items():
+                    if raw_grade.startswith(k):
+                        canonical = v
+                        break
+            if not canonical or matrix.get(canonical) is not None:
+                continue
+            val = entry.get('price')  # API field is 'price', not 'value'
+            if val is None:
+                continue
+            try:
+                val = float(val)
+                if currency == 'EUR':
+                    val = round(val * Config.EUR_TO_USD, 2)
+                elif currency == 'GBP':
+                    val = round(val * Config.GBP_TO_USD, 2)
+                elif currency == 'RON':
+                    val = round(val * Config.RON_TO_USD, 2)
+                else:
+                    val = round(val, 2)
+                matrix[canonical] = val
+            except (ValueError, TypeError):
+                continue
+        return matrix
+
+    @classmethod
+    def extract_baselines(cls, query: str, nominal: str, target_year: str) -> List[Dict[str, Any]]:
+        """Main entry-point: returns list of variant baseline dicts for target_year."""
+        print(f"{Colors.BLUE}🌐 [~] [NUMISTA API] Fetching official baseline data for '{query}'...{Colors.RESET}")
+
+        type_id = cls._find_type_id(query, nominal)
+        if not type_id:
             return []
 
-        soup = BeautifulSoup(page_text, 'lxml')
-        
-        page_text = soup.get_text(separator=" ", strip=True)
-        curr_match = re.search(r'Values.{0,50}in\s*([A-Za-z]+)', page_text)
-        if curr_match and 'USD' not in curr_match.group(1).upper():
-            num_cur = curr_match.group(1).upper()
-            print(f"{Colors.YELLOW}⚠️  [!] [NUMISTA] Values are in {num_cur}. Conversion applied.{Colors.RESET}")
-            numista_currency = num_cur
-        else:
-            numista_currency = "USD"
-            
-        target_table = None
-        
-        for table in soup.find_all('table'):
-            headers = [th.get_text(strip=True).upper() for th in table.find_all('th')]
-            if 'VF' in headers and 'XF' in headers:
-                target_table = table
-                break
-                
-        if not target_table:
+        issues_data = cls._api_get(f'/types/{type_id}/issues', {'lang': 'en'})
+        if not issues_data:
             return []
-            
-        headers = [th.get_text(strip=True).upper() for th in target_table.find_all('th')]
-        grade_map = {}
-        for grade in ['VG', 'F', 'VF', 'XF', 'AU', 'UNC']:
-            if grade in headers:
-                grade_map[grade] = headers.index(grade)
-                
-        extracted_rows = []
-        for row in target_table.find_all('tr'):
-            cells = row.find_all(['td', 'th'])
-            if not cells: continue
-            
-            row_text = row.get_text(separator=" ", strip=True)
-            if str(target_year) in row_text:
-                if len(cells) < max(grade_map.values()) + 1:
-                    continue
-                    
-                variant_name = cells[0].get_text(strip=True)
-                if not variant_name:
-                    variant_name = str(target_year)
-                    
-                matrix = {'PrAg': None, 'G': None, 'VG': None, 'F': None, 'VF': None, 'XF': None, 'AU': None, 'UNC': None}
-                
-                for grade, col_index in grade_map.items():
-                    if len(cells) <= col_index: continue
-                    cell_text = cells[col_index].get_text(strip=True)
-                    try:
-                        if bool(re.search(r'\d', cell_text)):
-                            clean_val = float(re.sub(r'[^\d.]', '', cell_text))
-                            if numista_currency == "EUR":
-                                clean_val = round(clean_val * Config.EUR_TO_USD, 2)
-                            elif numista_currency == "RON":
-                                clean_val = round(clean_val / 4.85, 2)
-                            elif numista_currency == "GBP":
-                                clean_val = round(clean_val * Config.GBP_TO_USD, 2)
-                        else:
-                            clean_val = None
-                    except ValueError:
-                        clean_val = None
-                        
-                    matrix[grade] = clean_val
-                    
-                extracted_rows.append({
-                    "mint_mark": variant_name,
-                    "NGC_baseline_prices": matrix # Kept identical key naming for UI rendering parity
+
+        results = []
+        for issue in issues_data:
+            issue_year = str(issue.get('year', ''))
+            issue_title = str(issue.get('title', ''))
+            if target_year not in issue_year and target_year not in issue_title:
+                continue
+
+            issue_id = issue['id']
+            variant_label = issue.get('comments') or issue.get('title') or target_year
+            print(f"{Colors.GREEN}  ✅ [NUMISTA API] Found issue: {variant_label} (Issue ID: {issue_id}){Colors.RESET}")
+
+            prices_data = cls._api_get(f'/types/{type_id}/issues/{issue_id}/prices')
+            if not prices_data:
+                continue
+
+            matrix = cls._map_prices(prices_data)
+            if any(v is not None for v in matrix.values()):
+                results.append({
+                    'mint_mark': variant_label,
+                    'NGC_baseline_prices': matrix  # Key kept for UI parity
                 })
-        
-        return extracted_rows
+
+        if not results:
+            print(f"{Colors.YELLOW}👻 [NUMISTA API] No price data for year {target_year}.{Colors.RESET}")
+        return results
 
 # ==========================================
 # POLYMORPHIC SOURCE INTERFACE
@@ -446,11 +547,13 @@ class MAShopsSource(AbstractMarketSource):
                  image_url = urllib.parse.urljoin("https://www.ma-shops.com", image_url)
                 
             if len(tds) >= 7:
-                country = tds[1].get_text(strip=True)
+                # Layout A: 7-column table. Year column (tds[3]) contains reign range e.g. '1881-1914'.
+                country_val = tds[1].get_text(strip=True)
                 nominal = tds[2].get_text(strip=True)
                 year = tds[3].get_text(strip=True)
-                if str(target_year) not in year: continue
-                
+                if str(target_year) not in year:
+                    continue
+
                 info_td = tds[4]
                 for bad_tag in info_td.find_all(['span', 'b', 'strong'], class_=re.compile(r'newgold|bold', re.I)):
                     bad_tag.decompose()
@@ -459,13 +562,17 @@ class MAShopsSource(AbstractMarketSource):
                 grade = tds[5].get_text(strip=True) or "UNGRADED"
                 price_td = tds[6]
             else:
-                country = tds[1].get_text(strip=True)
+                # Layout B: 5-column table — info is the description column
+                country_val = tds[1].get_text(strip=True)
                 info_td = tds[2]
                 for bad_tag in info_td.find_all(['span', 'b', 'strong'], class_=re.compile(r'newgold|bold', re.I)):
                     bad_tag.decompose()
                 info = info_td.get_text(separator=" ", strip=True)
-                
-                pass
+
+                # Layout B: verify year appears in the descriptive text
+                if str(target_year) not in info:
+                    continue
+
                 nominal = query.replace(str(target_year), "").strip()
                 year = str(target_year)
                 
@@ -508,7 +615,7 @@ class MAShopsSource(AbstractMarketSource):
                     continue
                 parsed_listings.append({
                     "source": "MA-Shops",
-                    "country": country,
+                    "country": country_val,
                     "nominal": nominal,
                     "year": year,
                     "grade": grade,
@@ -531,21 +638,19 @@ class eBaySource(AbstractMarketSource):
     @classmethod
     def validate_integrity(cls, title: str, target_year: str) -> bool:
         t_lower = title.lower()
+        # 1. Year must appear as an isolated token
         if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
             return False
-            
-        if target_year == "1881" and ("enescu" in t_lower or "1881-1955" in t_lower.replace(" ", "")):
-            return False
-            
+        # 2. Generic fake/replica filter
         fake_keywords = ['fantasy', 'replica', 'copy', 'fake', 'novelty', 'tribute']
         if any(fw in t_lower for fw in fake_keywords):
             return False
-            
+        # 3. Reject if any OTHER year appears in the title (catches wrong-year listings
+        #    e.g. "5 Lei 1880 Carol I (1866-1881)" when searching for 1881)
         years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
-        if years_found:
-            for y in years_found:
-                if y != str(target_year):
-                    return False
+        for y in years_found:
+            if y != str(target_year):
+                return False
         return True
 
     @staticmethod
@@ -673,21 +778,19 @@ class OkaziiSource(AbstractMarketSource):
     @classmethod
     def validate_integrity(cls, title: str, target_year: str) -> bool:
         t_lower = title.lower()
+        # 1. Year must appear as an isolated token
         if not re.search(rf'(?:^|[^a-z0-9]){target_year}(?:[^a-z0-9]|$)', t_lower):
             return False
-            
-        if target_year == "1881" and ("enescu" in t_lower or "1881-1955" in t_lower.replace(" ", "")):
-            return False
-            
+        # 2. Romanian-language fake/replica filter
+        # 2. Romanian-language fake/replica filter
         fake_keywords = ['copie', 'replica', 'fals', 'fantezie']
         if any(fw in t_lower for fw in fake_keywords):
             return False
-            
+        # 3. Reject if any OTHER year appears in the title
         years_found = re.findall(r'(?:^|[^a-z0-9])(1[789]\d\d|20\d\d)(?:[^a-z0-9]|$)', t_lower)
-        if years_found:
-            for y in years_found:
-                if y != str(target_year) and y not in ['1914', '1901', '1882', '1883', '1884', '1885', '1880']:
-                    return False
+        for y in years_found:
+            if y != str(target_year):
+                return False
         return True
 
     @staticmethod
@@ -844,7 +947,17 @@ class OkaziiSource(AbstractMarketSource):
 # PHASE 6: GRAND UNIFICATION ORCHESTRATOR
 # ==========================================
 def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal: str):
+    # DEDUPLICATE: If nominal starts with country (e.g. "Romania 5 Lei"), clean it for better matching (e.g. "5 Lei")
+    clean_nominal = nominal
+    if country.lower() in nominal.lower():
+        # Strip country name, optional "Coin", and trailing/leading separators
+        clean_nominal = re.sub(rf'^{re.escape(country)}[\s\-]*', '', nominal, flags=re.IGNORECASE)
+        clean_nominal = re.sub(r'^(Coin|Moneda|Monedă)[\s\-]*', '', clean_nominal, flags=re.IGNORECASE).strip()
+    
+    # search_query used for broad web searches (eBay, DDG, etc.)
     search_query = f"{nominal} {target_year}"
+    # Use clean nominal if drastically different (shorter) for precise matching tools
+    match_nominal = clean_nominal if len(clean_nominal) < len(nominal) else nominal
     
     output_payload = {
         "metadata": {
@@ -901,42 +1014,75 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         
         return "UNGRADED"
 
-    # 1. ORCHESTRATE THREAD POOL EXECUTION
-    def fetch_ngc() -> list:
-        try:
-            url = NGCScraper.get_ngc_url(country, km_num)
-            return NGCScraper.extract_baselines(url, target_year) if url else []
-        except Exception as e:
-            print(f"{Colors.RED}❌ [!] [NGC] Thread Error: {str(e)}{Colors.RESET}")
-            return []
-
-    def fetch_numista() -> list:
-        try:
-            return NumistaScraper.extract_baselines(search_query, target_year)
-        except Exception as e:
-            print(f"{Colors.RED}❌ [!] [NUMISTA] Thread Error: {str(e)}{Colors.RESET}")
-            return []
+    # 1. FETCH LIVE FX RATES FOR THIS SCAN SESSION
+    fx = fetch_fx_rates()
+    Config.EUR_TO_USD = fx['eur']
+    Config.GBP_TO_USD = fx['gbp']
+    Config.RON_TO_USD = fx['ron']
 
     print(f"\n{Colors.BLUE}===================================================={Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}  SPINNING UP ASYNCHRONOUS THREAD POOL ENGINE{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  SEQUENTIAL MARKET SCAN ENGINE — 7 STEPS{Colors.RESET}")
     print(f"{Colors.BLUE}===================================================={Colors.RESET}")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        f_ngc = executor.submit(fetch_ngc)
-        f_numista = executor.submit(fetch_numista)
-        f_mashops = executor.submit(MAShopsSource.fetch_active, search_query, target_year, country)
-        f_ebay_active = executor.submit(eBaySource.fetch_active, search_query, target_year, country)
-        f_ebay_sold = executor.submit(eBaySource.fetch_sold, search_query, target_year, country)
-        f_okazii_active = executor.submit(OkaziiSource.fetch_active, search_query, target_year, country)
-        f_okazii_sold = executor.submit(OkaziiSource.fetch_sold, search_query, target_year, country)
-        
-        output_payload["baselines"]["ngc"] = f_ngc.result()
-        output_payload["baselines"]["numista"] = f_numista.result()
-        mashops_data = f_mashops.result()
-        ebay_active_data = f_ebay_active.result()
-        ebay_sold_data = f_ebay_sold.result()
-        okazii_active_data = f_okazii_active.result()
-        okazii_sold_data = f_okazii_sold.result()
+
+    # STEP 1 — NGC CATALOG BASELINE
+    print(f"\n{Colors.BOLD}[STEP 1/7] NGC Catalog Baseline{Colors.RESET}")
+    try:
+        url = NGCScraper.get_ngc_url(country, km_num)
+        output_payload["baselines"]["ngc"] = NGCScraper.extract_baselines(url, target_year) if url else []
+    except Exception as e:
+        print(f"{Colors.RED}❌ [NGC] Failed: {e}{Colors.RESET}")
+        output_payload["baselines"]["ngc"] = []
+
+    # STEP 2 — NUMISTA API BASELINE
+    print(f"\n{Colors.BOLD}[STEP 2/7] Numista API Baseline{Colors.RESET}")
+    try:
+        # Use match_nominal for precision logic
+        output_payload["baselines"]["numista"] = NumistaAPIScraper.extract_baselines(
+            search_query, match_nominal, target_year
+        )
+    except Exception as e:
+        print(f"{Colors.RED}❌ [NUMISTA API] Failed: {e}{Colors.RESET}")
+        output_payload["baselines"]["numista"] = []
+
+    # STEP 3 — MA-SHOPS ACTIVE LISTINGS
+    print(f"\n{Colors.BOLD}[STEP 3/7] MA-Shops Live Retail{Colors.RESET}")
+    try:
+        mashops_data = MAShopsSource.fetch_active(search_query, target_year, country)
+    except Exception as e:
+        print(f"{Colors.RED}❌ [MA-SHOPS] Failed: {e}{Colors.RESET}")
+        mashops_data = []
+
+    # STEP 4 — EBAY ACTIVE LISTINGS
+    print(f"\n{Colors.BOLD}[STEP 4/7] eBay Active Listings{Colors.RESET}")
+    try:
+        ebay_active_data = eBaySource.fetch_active(search_query, target_year, country)
+    except Exception as e:
+        print(f"{Colors.RED}❌ [EBAY ACTIVE] Failed: {e}{Colors.RESET}")
+        ebay_active_data = []
+
+    # STEP 5 — EBAY SOLD LISTINGS
+    print(f"\n{Colors.BOLD}[STEP 5/7] eBay Sold Listings{Colors.RESET}")
+    try:
+        ebay_sold_data = eBaySource.fetch_sold(search_query, target_year, country)
+    except Exception as e:
+        print(f"{Colors.RED}❌ [EBAY SOLD] Failed: {e}{Colors.RESET}")
+        ebay_sold_data = []
+
+    # STEP 6 — OKAZII ACTIVE LISTINGS
+    print(f"\n{Colors.BOLD}[STEP 6/7] Okazii Active Listings{Colors.RESET}")
+    try:
+        okazii_active_data = OkaziiSource.fetch_active(search_query, target_year, country)
+    except Exception as e:
+        print(f"{Colors.RED}❌ [OKAZII ACTIVE] Failed: {e}{Colors.RESET}")
+        okazii_active_data = []
+
+    # STEP 7 — OKAZII SOLD LISTINGS
+    print(f"\n{Colors.BOLD}[STEP 7/7] Okazii Sold (Archive){Colors.RESET}")
+    try:
+        okazii_sold_data = OkaziiSource.fetch_sold(search_query, target_year, country)
+    except Exception as e:
+        print(f"{Colors.RED}❌ [OKAZII SOLD] Failed: {e}{Colors.RESET}")
+        okazii_sold_data = []
 
     combined_active = mashops_data + ebay_active_data + okazii_active_data
     combined_sold = ebay_sold_data + okazii_sold_data
@@ -1034,18 +1180,19 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         }
 
     # 5. COMPILE AND EXPORT
-    with open("market_data.json", "w", encoding="utf-8") as f:
-        json.dump(output_payload, f, indent=4)
+    if os.environ.get("DEBUG_LOCAL"):
+        with open("market_data.json", "w", encoding="utf-8") as f:
+            json.dump(output_payload, f, indent=4)
+        print(f"{Colors.GREEN}[+] Debug: output flushed to market_data.json{Colors.RESET}")
         
     print(f"\n{Colors.BOLD}{Colors.HEADER}====================================================")
     print(f"             📦 MARKET MATRIX PACKAGED 📦")
     print(f"===================================================={Colors.RESET}")
     print(f"NGC Catalog Baseline   : {len(output_payload['baselines']['ngc'])}")
-    print(f"Numista Catalog Base   : {len(output_payload['baselines']['numista'])}")
-    
+    print(f"Numista API Baseline   : {len(output_payload['baselines']['numista'])}")
     print(f"Active Retail Deals    : {len(output_payload['active_listings'])}")
     print(f"Historical Sold Assets : {len(output_payload['sold_listings'])}")
-    print(f"{Colors.GREEN}[+] Unified output securely flushed to market_data.json{Colors.RESET}\n")
+    print(f"{Colors.GREEN}[+] Scan complete. Returning unified payload.{Colors.RESET}\n")
 
     return output_payload
 
