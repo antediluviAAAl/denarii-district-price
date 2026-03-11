@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+import concurrent.futures
 _SCRAPLING_OK = False
 _SCRAPLING_ERR = "Not attempted"
 
@@ -1094,68 +1095,74 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     Config.RON_TO_USD = fx['ron']
 
     print(f"\n{Colors.BLUE}===================================================={Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}  SEQUENTIAL MARKET SCAN ENGINE — 7 STEPS{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  STAGGERED PARALLEL MARKET SCAN ENGINE{Colors.RESET}")
     print(f"{Colors.BLUE}===================================================={Colors.RESET}")
 
-    # STEP 1 — NGC CATALOG BASELINE
-    print(f"\n{Colors.BOLD}[STEP 1/7] NGC Catalog Baseline{Colors.RESET}")
-    try:
-        url = NGCScraper.get_ngc_url(country, km_num)
-        output_payload["baselines"]["ngc"] = NGCScraper.extract_baselines(url, target_year) if url else []
-    except Exception as e:
-        print(f"{Colors.RED}❌ [NGC] Failed: {e}{Colors.RESET}")
-        output_payload["baselines"]["ngc"] = []
+    def run_ngc():
+        print(f"{Colors.BOLD}[LANE A] NGC Catalog Baseline{Colors.RESET}")
+        try:
+            url = NGCScraper.get_ngc_url(country, km_num)
+            return NGCScraper.extract_baselines(url, target_year) if url else []
+        except Exception as e:
+            print(f"{Colors.RED}❌ [NGC] Failed: {e}{Colors.RESET}")
+            return []
 
-    # STEP 2 — NUMISTA API BASELINE
-    print(f"\n{Colors.BOLD}[STEP 2/7] Numista API Baseline{Colors.RESET}")
-    try:
-        # Use match_nominal for precision logic
-        output_payload["baselines"]["numista"] = NumistaAPIScraper.extract_baselines(
-            search_query, match_nominal, target_year
-        )
-    except Exception as e:
-        print(f"{Colors.RED}❌ [NUMISTA API] Failed: {e}{Colors.RESET}")
-        output_payload["baselines"]["numista"] = []
+    def run_numista():
+        print(f"{Colors.BOLD}[LANE B] Numista API Baseline{Colors.RESET}")
+        try:
+            return NumistaAPIScraper.extract_baselines(search_query, match_nominal, target_year)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [NUMISTA API] Failed: {e}{Colors.RESET}")
+            return []
 
-    # STEP 3 — MA-SHOPS ACTIVE LISTINGS
-    print(f"\n{Colors.BOLD}[STEP 3/7] MA-Shops Live Retail{Colors.RESET}")
-    try:
-        mashops_data = MAShopsSource.fetch_active(search_query, target_year, country, clean_nominal)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [MA-SHOPS] Failed: {e}{Colors.RESET}")
-        mashops_data = []
+    def run_mashops():
+        print(f"{Colors.BOLD}[LANE C] MA-Shops Live Retail{Colors.RESET}")
+        try:
+            return MAShopsSource.fetch_active(search_query, target_year, country, clean_nominal)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [MA-SHOPS] Failed: {e}{Colors.RESET}")
+            return []
 
-    # STEP 4 — EBAY ACTIVE LISTINGS
-    print(f"\n{Colors.BOLD}[STEP 4/7] eBay Active Listings{Colors.RESET}")
-    try:
-        ebay_active_data = eBaySource.fetch_active(search_query, target_year, country, clean_nominal)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [EBAY ACTIVE] Failed: {e}{Colors.RESET}")
-        ebay_active_data = []
+    def run_ebay_lane():
+        print(f"{Colors.BOLD}[LANE D] eBay (Active + Sold) - Sequential{Colors.RESET}")
+        active = []
+        sold = []
+        try:
+            active = eBaySource.fetch_active(search_query, target_year, country, clean_nominal)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [EBAY ACTIVE] Failed: {e}{Colors.RESET}")
+        try:
+            sold = eBaySource.fetch_sold(search_query, target_year, country, clean_nominal)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [EBAY SOLD] Failed: {e}{Colors.RESET}")
+        return active, sold
 
-    # STEP 5 — EBAY SOLD LISTINGS
-    print(f"\n{Colors.BOLD}[STEP 5/7] eBay Sold Listings{Colors.RESET}")
-    try:
-        ebay_sold_data = eBaySource.fetch_sold(search_query, target_year, country, clean_nominal)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [EBAY SOLD] Failed: {e}{Colors.RESET}")
-        ebay_sold_data = []
+    def run_okazii_lane():
+        print(f"{Colors.BOLD}[LANE E] Okazii (Active + Sold) - Sequential{Colors.RESET}")
+        active = []
+        sold = []
+        try:
+            active = OkaziiSource.fetch_active(search_query, target_year, country, clean_nominal)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [OKAZII ACTIVE] Failed: {e}{Colors.RESET}")
+        try:
+            sold = OkaziiSource.fetch_sold(search_query, target_year, country, clean_nominal)
+        except Exception as e:
+            print(f"{Colors.RED}❌ [OKAZII SOLD] Failed: {e}{Colors.RESET}")
+        return active, sold
 
-    # STEP 6 — OKAZII ACTIVE LISTINGS
-    print(f"\n{Colors.BOLD}[STEP 6/7] Okazii Active Listings{Colors.RESET}")
-    try:
-        okazii_active_data = OkaziiSource.fetch_active(search_query, target_year, country, clean_nominal)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [OKAZII ACTIVE] Failed: {e}{Colors.RESET}")
-        okazii_active_data = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_ngc = executor.submit(run_ngc)
+        future_numista = executor.submit(run_numista)
+        future_mashops = executor.submit(run_mashops)
+        future_ebay = executor.submit(run_ebay_lane)
+        future_okazii = executor.submit(run_okazii_lane)
 
-    # STEP 7 — OKAZII SOLD LISTINGS
-    print(f"\n{Colors.BOLD}[STEP 7/7] Okazii Sold (Archive){Colors.RESET}")
-    try:
-        okazii_sold_data = OkaziiSource.fetch_sold(search_query, target_year, country, clean_nominal)
-    except Exception as e:
-        print(f"{Colors.RED}❌ [OKAZII SOLD] Failed: {e}{Colors.RESET}")
-        okazii_sold_data = []
+        output_payload["baselines"]["ngc"] = future_ngc.result()
+        output_payload["baselines"]["numista"] = future_numista.result()
+        mashops_data = future_mashops.result()
+        ebay_active_data, ebay_sold_data = future_ebay.result()
+        okazii_active_data, okazii_sold_data = future_okazii.result()
 
     combined_active = mashops_data + ebay_active_data + okazii_active_data
     combined_sold = ebay_sold_data + okazii_sold_data
