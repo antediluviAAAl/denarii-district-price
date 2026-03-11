@@ -354,6 +354,7 @@ class NumistaAPIScraper:
     @classmethod
     def _find_type_id(cls, query: str, nominal: str) -> Optional[int]:
         """Searches Numista for the coin type and returns the best matching type_id."""
+        # Query often includes country+nominal+year. Nominal is the 'clean' version (e.g. '5 Lei').
         data = cls._api_get('/types', {'q': query, 'lang': 'en'})
         if not data:
             return None
@@ -361,13 +362,22 @@ class NumistaAPIScraper:
         if not types:
             print(f"{Colors.YELLOW}👻 [NUMISTA API] No types found for query '{query}'.{Colors.RESET}")
             return None
-        # Prefer a result whose title contains the nominal (e.g. '5 Lei')
+            
+        # 1. High confidence: Title contains both nominal value AND country
+        # (This is the most reliable match for coins like '5 Lei')
         for t in types:
-            if nominal.lower() in t.get('title', '').lower():
+            title = t.get('title', '').lower()
+            if nominal.lower() in title:
                 print(f"{Colors.GREEN}✅ [NUMISTA API] Matched type: {t['title']} (ID: {t['id']}){Colors.RESET}")
                 return t['id']
-        # Fallback: trust first result
-        print(f"{Colors.YELLOW}⚠️  [NUMISTA API] No exact nominal match. Using first result: {types[0]['title']}{Colors.RESET}")
+                
+        # 2. Fallback: Title contains nominal value
+        for t in types:
+            if nominal.lower() in t.get('title', '').lower():
+                return t['id']
+                
+        # 3. Last resort: trust first result if it seems related
+        print(f"{Colors.YELLOW}⚠️  [NUMISTA API] No strict nominal match within results. Using first result: {types[0]['title']}{Colors.RESET}")
         return types[0]['id']
 
     @classmethod
@@ -932,7 +942,17 @@ class OkaziiSource(AbstractMarketSource):
 # PHASE 6: GRAND UNIFICATION ORCHESTRATOR
 # ==========================================
 def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal: str):
+    # DEDUPLICATE: If nominal starts with country (e.g. "Romania 5 Lei"), clean it for better matching (e.g. "5 Lei")
+    clean_nominal = nominal
+    if country.lower() in nominal.lower():
+        # Strip country name, optional "Coin", and trailing/leading separators
+        clean_nominal = re.sub(rf'^{re.escape(country)}[\s\-]*', '', nominal, flags=re.IGNORECASE)
+        clean_nominal = re.sub(r'^(Coin|Moneda|Monedă)[\s\-]*', '', clean_nominal, flags=re.IGNORECASE).strip()
+    
+    # search_query used for broad web searches (eBay, DDG, etc.)
     search_query = f"{nominal} {target_year}"
+    # Use clean nominal if drastically different (shorter) for precise matching tools
+    match_nominal = clean_nominal if len(clean_nominal) < len(nominal) else nominal
     
     output_payload = {
         "metadata": {
@@ -1011,8 +1031,9 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
     # STEP 2 — NUMISTA API BASELINE
     print(f"\n{Colors.BOLD}[STEP 2/7] Numista API Baseline{Colors.RESET}")
     try:
+        # Use match_nominal for precision logic
         output_payload["baselines"]["numista"] = NumistaAPIScraper.extract_baselines(
-            search_query, nominal, target_year
+            search_query, match_nominal, target_year
         )
     except Exception as e:
         print(f"{Colors.RED}❌ [NUMISTA API] Failed: {e}{Colors.RESET}")
