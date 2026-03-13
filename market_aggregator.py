@@ -86,6 +86,34 @@ def fetch_fx_rates() -> dict:
         _CACHED_FX = _DEFAULTS
         return _CACHED_FX
 
+def format_market_date(d: str) -> str:
+    """Standardizes various scraper date formats to 'MMM D, YYYY' (e.g., 'Jan 7, 2026')."""
+    if not d or d in ['Active', 'Live', 'Recent', 'Unknown']:
+        return d
+    
+    # Try parsing YYYY-MM-DD (Okazii)
+    try:
+        from datetime import datetime
+        if re.match(r'\d{4}-\d{1,2}-\d{1,2}', d):
+            dt = datetime.strptime(d, '%Y-%m-%d')
+            return dt.strftime('%b %d, %Y')
+        
+        # Try parsing 'Jan 7, 2026' or 'Jan 07, 2026' (eBay)
+        # Already in requested format or close to it
+        if re.match(r'[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}', d):
+            dt = datetime.strptime(d, '%b %d, %Y')
+            return dt.strftime('%b %d, %Y')
+
+        # Try parsing '07-Jan-2026' (eBay variant)
+        if re.match(r'\d{1,2}-[A-Za-z]{3}-\d{4}', d):
+            dt = datetime.strptime(d, '%d-%b-%Y')
+            return dt.strftime('%b %d, %Y')
+            
+    except Exception:
+        pass
+        
+    return d
+
 class Config:
     NGC_BASE_URL = "https://www.ngccoin.com/price-guide/world"
     MASHOPS_BASE_URL = "https://www.ma-shops.com/shops/search.php"
@@ -669,6 +697,7 @@ class MAShopsSource(AbstractMarketSource):
                     "price_usd": round(usd_normalized, 2),
                     "item_url": item_url,
                     "image_url": image_url,
+                    "date": "Live",
                     "is_valid":is_valid,
                     "rejection_reason":rejection_reason
                 })
@@ -776,7 +805,7 @@ class eBaySource(AbstractMarketSource):
                 elif not cls.validate_integrity(title, str(target_year)):
                     is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
                 
-            title = title.replace("New Listing", "").strip()
+            title = title.replace("New Listing", "").replace("Opens in a new window or tab", "").strip()
             price_str = price_el.get_text(strip=True)
             url_href = link_el.get('href', '') if link_el else ""
             image_url = img_el.get('src', '') if img_el else ""
@@ -797,10 +826,10 @@ class eBaySource(AbstractMarketSource):
                 date_match_int = re.search(r'\d{1,2}-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4}', item_text, re.IGNORECASE)
                 date_str = date_match_int.group(0) if date_match_int else ("Active" if not 'Sold' in source_tag else "Recent")
 
-            info_str = f"[{'SOLD' if 'Sold' in source_tag else 'RETAIL'}] " + title
+            info_str = title
 
             parsed_listings.append({
-                "source": source_tag,
+                "source": "Ebay",
                 "country": country,
                 "nominal": nominal,
                 "year": str(target_year),
@@ -809,7 +838,7 @@ class eBaySource(AbstractMarketSource):
                 "price_usd": clean_price,
                 "item_url": url_href,
                 "image_url": image_url,
-                "date": date_str,
+                "date": format_market_date(date_str),
                 "is_valid": is_valid,
                 "rejection_reason": rejection_reason
             })
@@ -995,9 +1024,9 @@ class OkaziiSource(AbstractMarketSource):
             if not any(kw in title_lower for kw in country_keywords):
                 is_valid, rejection_reason = False, "COUNTRY_MISSING"
 
-            info_str = f"[{'SOLD' if is_sold else 'RETAIL'}] " + title
+            info_str = title
             results.append({
-                "source": "Okazii (Archive)" if is_sold else "Okazii",
+                "source": "Okazii",
                 "country": country,
                 "nominal": nominal,
                 "year": str(target_year),
@@ -1006,7 +1035,7 @@ class OkaziiSource(AbstractMarketSource):
                 "price_usd": round(normalized_usd, 2),
                 "item_url": link,
                 "image_url": image_url,
-                "date": date_str,
+                "date": format_market_date(date_str),
                 "is_valid": is_valid,
                 "rejection_reason": rejection_reason
             })
@@ -1266,6 +1295,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         prices = [item["price_usd"] for item in dedup_active]
         output_payload["metrics"]["active"] = {
             "median": round(statistics.median(prices), 2),
+            "average": round(statistics.mean(prices), 2), # Added Average
             "min": round(min(prices), 2),
             "max": round(max(prices), 2),
             "supply": len(dedup_active)
@@ -1274,6 +1304,7 @@ def orchestrate_market_scan(country: str, km_num: str, target_year: str, nominal
         prices = [item["price_usd"] for item in dedup_sold]
         output_payload["metrics"]["sold"] = {
             "median": round(statistics.median(prices), 2),
+            "average": round(statistics.mean(prices), 2), # Added Average
             "min": round(min(prices), 2),
             "max": round(max(prices), 2),
             "supply": len(dedup_sold)
