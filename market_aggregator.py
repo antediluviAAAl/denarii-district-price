@@ -958,18 +958,35 @@ class OkaziiSource(AbstractMarketSource):
             
             if str(target_year) not in title: continue
             
+            # NEW REFINED EXTRACTION LOGIC
+            # 1. Isolate the main product info container and exclude recommendations
+            for rec in soup.select('.expiredProductRecommendations, #expiredProductRecommendations, .carousel-listing-bottom'):
+                rec.decompose()
+            
+            main_container = soup.select_one('.product-top-info, .product-data, .okazii-product-page, #listing-header')
+            search_area = main_container if main_container else soup
+            search_text = search_area.get_text(separator=" ", strip=True).lower()
+
             raw_price = 0.0
             currency = "RON"
+
+            # 2. Try specific price selectors first
+            price_found = False
             
-            pret_match = re.search(r'pre[tț]\s*:\s*([\d.,]+)\s*(lei|ron|€|eur)', page_text, re.IGNORECASE)
-            if pret_match:
-                clean_str = pret_match.group(1).replace('.', '').replace(',', '.')
-                try: raw_price = float(clean_str)
+            # Check meta tags first (most reliable)
+            price_meta = soup.find('meta', itemprop='price')
+            if price_meta and price_meta.get('content'):
+                try: 
+                    raw_price = float(price_meta.get('content'))
+                    currency_meta = soup.find('meta', itemprop='priceCurrency')
+                    if currency_meta and 'EUR' in currency_meta.get('content', '').upper():
+                        currency = "EUR"
+                    price_found = True
                 except ValueError: pass
-                if "€" in pret_match.group(2) or "eur" in pret_match.group(2).lower(): currency = "EUR"
-                    
-            if raw_price == 0.0:
-                price_el = soup.select_one('.item-price')
+
+            if not price_found:
+                # Check specific CSS classes
+                price_el = search_area.select_one('.tl-price, .item-price, .product-price, .listing-price, .product-top-buy .price, .product-top-bid .price, .ok-item-price')
                 if price_el:
                     price_text = price_el.get_text(strip=True).replace('.', '').replace(',', '.')
                     pmatch = re.search(r'([\d.]+)', price_text)
@@ -977,14 +994,21 @@ class OkaziiSource(AbstractMarketSource):
                         raw_price = float(pmatch.group(1))
                         if 'eur' in price_text.lower() or '€' in price_text:
                             currency = "EUR"
-                            
-            if raw_price == 0.0:
-                price_meta = soup.find('meta', itemprop='price')
-                if price_meta and price_meta.get('content'):
-                    try: raw_price = float(price_meta.get('content'))
+                        price_found = True
+
+            if not price_found:
+                # Fallback to regex search but ONLY within the main container text
+                pret_match = re.search(r'pre[tț]\s*:\s*([\d.,]+)\s*(lei|ron|€|eur)', search_text, re.IGNORECASE)
+                if pret_match:
+                    clean_str = pret_match.group(1).replace('.', '').replace(',', '.')
+                    try: 
+                        raw_price = float(clean_str)
+                        if "€" in pret_match.group(2) or "eur" in pret_match.group(2).lower(): 
+                            currency = "EUR"
+                        price_found = True
                     except ValueError: pass
-                    
-            if raw_price == 0.0: continue
+
+            if not price_found or raw_price == 0.0: continue
             
             normalized_usd = raw_price * Config.RON_TO_USD if currency == "RON" else raw_price * Config.EUR_TO_USD
             
