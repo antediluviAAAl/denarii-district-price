@@ -848,22 +848,22 @@ class eBaySource(AbstractMarketSource):
     @classmethod
     def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000&LH_BIN=1"
-        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Fixed-Price Deals: {url}{Colors.RESET}")
+        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_ItemCondition=4|10|3000&LH_BIN=1&_sop=12"
+        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY ACTIVE] Querying Newly Listed Fixed-Price Deals: {url}{Colors.RESET}")
         return cls.run_ebay_search(url, query, target_year, country, nominal, "eBay (Active)")
 
     @classmethod
     def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_Sold=1&LH_Complete=1"
-        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY SOLD] Querying Sold Liquidity Floor: {url}{Colors.RESET}")
+        url = f"https://www.ebay.com/sch/i.html?_nkw={encoded_query}&LH_Sold=1&LH_Complete=1&_sop=13"
+        print(f"{Colors.CYAN}🌐 [NETWORK] [EBAY SOLD] Querying Recently Ended Sold Items: {url}{Colors.RESET}")
         return cls.run_ebay_search(url, query, target_year, country, nominal, "eBay (Sold)")
 
 # ==========================================
 # PHASE 5: OKAZII ROMANIAN MARKET EXTRACTOR
 # ==========================================
 class OkaziiSource(AbstractMarketSource):
-    FAKE_TERMS = ['copie', 'replica', 'fals', 'fantezie']
+    FAKE_TERMS = ['copie', 'replica', 'replici', 'fals', 'fantezie']
 
     @classmethod
     def validate_integrity(cls, title: str, target_year: str, extra_fake_terms: List[str] = []) -> bool:
@@ -885,177 +885,179 @@ class OkaziiSource(AbstractMarketSource):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
         }
 
-    @classmethod
-    def get_okazii_links(cls, query, is_sold):
-        if not is_sold:
-            encoded_query = urllib.parse.quote_plus(query)
-            search_url = f"https://www.okazii.ro/cautare/{encoded_query}.html"
-            page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="OKAZII SEARCH")
-            if page_text:
-                soup = BeautifulSoup(page_text, "lxml")
-                links = []
-                for a in soup.find_all('a', href=True):
-                    href = a['href']
-                    if 'okazii.ro' in href and '-a' in href and 'cautare' not in href:
-                        links.append(href)
-                return list(dict.fromkeys(links))[:10]
-
-        archived_term = '"stoc epuizat"' if is_sold else '-"stoc epuizat"'
-        proxy_query = f'site:okazii.ro {archived_term} "{query}"'
-        encoded_query = urllib.parse.quote_plus(proxy_query)
-        search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        
-        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label="OKAZII DDG")
-        if not page_text:
-            return []
+    @staticmethod
+    def _parse_romanian_date(date_str: str) -> str:
+        """Parses Romanian relative and abbreviated dates into YYYY-MM-DD."""
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        ds = date_str.lower().strip()
+        try:
+            if 'azi' in ds: 
+                return now.strftime('%Y-%m-%d')
+            if 'ieri' in ds:
+                return (now - timedelta(days=1)).strftime('%Y-%m-%d')
             
-        decoded_html = urllib.parse.unquote(page_text)
-        okazii_pattern = r'https://(?:www\.)?okazii\.ro/(?!recomandate|cautare|catalog)[^\s"\'<>]+-a\d{8,}'
-        raw_matches = re.findall(okazii_pattern, decoded_html)
-        return list(dict.fromkeys(raw_matches))[:10]
+            months_ro = {
+                'ian': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'mai': 5, 'iun': 6,
+                'iul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'noi': 11, 'dec': 12
+            }
+            # Match '29 Ian.' or '29 Ianuarie'
+            match = re.search(r'(\d{1,2})\s+([a-z]{3})', ds)
+            if match:
+                day, month_abbr = int(match.group(1)), match.group(2)
+                month = months_ro.get(month_abbr)
+                if month:
+                    year = now.year if month <= now.month else now.year - 1
+                    return f"{year}-{month:02d}-{day:02d}"
+        except Exception:
+            pass
+        return "Recent"
 
     @classmethod
     def fetch_active(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, nominal, False)
+        return cls._fetch_listings(query, target_year, country, nominal, is_sold=False)
 
     @classmethod
     def fetch_sold(cls, query: str, target_year: str, country: str, nominal: str) -> List[Dict[str, Any]]:
-        return cls._fetch_listings(query, target_year, country, nominal, True)
+        return cls._fetch_listings(query, target_year, country, nominal, is_sold=True)
 
     @classmethod
     def _fetch_listings(cls, query: str, target_year: str, country: str, nominal: str, is_sold: bool) -> List[Dict[str, Any]]:
         mode_str = "SOLD" if is_sold else "ACTIVE"
-        print(f"{Colors.CYAN}🌐 [NETWORK] [OKAZII {mode_str}] Querying Discovery Proxy for Romanian Listings...{Colors.RESET}")
+        print(f"{Colors.CYAN}🌐 [NETWORK] [OKAZII {mode_str}] Querying Unified Search Page (sort=recent)...{Colors.RESET}")
         
-        links = cls.get_okazii_links(query, is_sold)
-        if not links: return []
-        
-        print(f"{Colors.BLUE}🔍 [PARSER] [OKAZII {mode_str}] Evaluating {len(links)} DOM entry points...{Colors.RESET}")
+        encoded_query = urllib.parse.quote_plus(query)
+        search_url = f"https://www.okazii.ro/cautare/{encoded_query}.html?sort=recent"
+        if is_sold:
+            search_url += "&with_bids=1"
+            
+        page_text = smart_fetch(search_url, headers=cls.get_headers(), retry_limit=10, label=f"OKAZII {mode_str}")
+        if not page_text:
+            return []
+            
+        soup = BeautifulSoup(page_text, 'lxml')
+        items = soup.select('.list-item')
+        if not items:
+            # Fallback for alternative layouts
+            items = soup.select('.product-item, .listing-item')
+            
+        if not items:
+            print(f"{Colors.YELLOW}⚠️  [OKAZII {mode_str}] No listings found on search page.{Colors.RESET}")
+            return []
+            
+        print(f"{Colors.BLUE}🔍 [PARSER] [OKAZII {mode_str}] Evaluating {len(items)} listings directly...{Colors.RESET}")
         
         results = []
-        for link in links:
-            page_text = smart_fetch(link, headers=cls.get_headers(), retry_limit=10, label=f"OKAZII {mode_str}")
-            if not page_text: continue
+        for i, item in enumerate(items):
+            title_el = item.select_one('.item-title a, .product-title a, a.NousernameProdus')
+            title = ""
+            if title_el:
+                title = title_el.get_text(strip=True) or title_el.get('title', '').strip()
+                if not title:
+                     title = title_el.parent.get_text(strip=True)
             
-            soup = BeautifulSoup(page_text, 'lxml')
-            page_text = soup.get_text(separator=" ", strip=True).lower()
+            # Fallback for nested titles
+            if not title:
+                title_alt = item.select_one('.item-title, .product-title')
+                if title_alt:
+                    title = title_alt.get_text(strip=True)
             
-            is_archived = "stoc epuizat" in page_text or "produs indisponibil" in page_text or "vandut" in page_text or "nu este pe stoc" in page_text
-            
-            # Since DDG is returning limited results, if we are specifically fetching active, and the DDG search was for active (no "stoc epuizat"),
-            # but the page says it's out of stock, we drop it. Conversely, if we want sold, and it IS out of stock, we keep it.
-            # But the user mentioned it was wrongly classed. Let's force the label based on what it actually is, then append to the respective list.
-            is_valid = True
-            rejection_reason = None
-            
-            if is_sold and not is_archived: 
-                is_valid, rejection_reason = False, "EXPECTED_SOLD_GOT_ACTIVE"
-            elif not is_sold and is_archived: 
-                is_valid, rejection_reason = False, "EXPECTED_ACTIVE_GOT_SOLD"
+            if not title:
+                continue
                 
-            title_el = soup.find('h1')
-            title = title_el.get_text(strip=True) if title_el else "Unknown Title"
-            
-            if str(target_year) not in title: continue
-            
-            # NEW REFINED EXTRACTION LOGIC
-            # 1. Isolate the main product info container and exclude recommendations
-            for rec in soup.select('.expiredProductRecommendations, #expiredProductRecommendations, .carousel-listing-bottom'):
-                rec.decompose()
-            
-            main_container = soup.select_one('.product-top-info, .product-data, .okazii-product-page, #listing-header')
-            search_area = main_container if main_container else soup
-            search_text = search_area.get_text(separator=" ", strip=True).lower()
-
+            link = title_el.get('href', '')
+            if link and not link.startswith('http'):
+                link = urllib.parse.urljoin("https://www.okazii.ro", link)
+                
+            # Price Extraction
             raw_price = 0.0
             currency = "RON"
-
-            # 2. Try specific price selectors first
-            price_found = False
             
-            # Check meta tags first (most reliable)
-            price_meta = soup.find('meta', itemprop='price')
-            if price_meta and price_meta.get('content'):
-                try: 
-                    raw_price = float(price_meta.get('content'))
-                    currency_meta = soup.find('meta', itemprop='priceCurrency')
-                    if currency_meta and 'EUR' in currency_meta.get('content', '').upper():
-                        currency = "EUR"
-                    price_found = True
-                except ValueError: pass
-
-            if not price_found:
-                # Check specific CSS classes
-                price_el = search_area.select_one('.tl-price, .item-price, .product-price, .listing-price, .product-top-buy .price, .product-top-bid .price, .ok-item-price')
-                if price_el:
-                    price_text = price_el.get_text(strip=True).replace('.', '').replace(',', '.')
-                    pmatch = re.search(r'([\d.]+)', price_text)
-                    if pmatch:
-                        raw_price = float(pmatch.group(1))
-                        if 'eur' in price_text.lower() or '€' in price_text:
-                            currency = "EUR"
-                        price_found = True
-
-            if not price_found:
-                # Fallback to regex search but ONLY within the main container text
-                pret_match = re.search(r'pre[tț]\s*:\s*([\d.,]+)\s*(lei|ron|€|eur)', search_text, re.IGNORECASE)
-                if pret_match:
-                    clean_str = pret_match.group(1).replace('.', '').replace(',', '.')
-                    try: 
-                        raw_price = float(clean_str)
-                        if "€" in pret_match.group(2) or "eur" in pret_match.group(2).lower(): 
-                            currency = "EUR"
-                        price_found = True
-                    except ValueError: pass
-
-            if not price_found or raw_price == 0.0: continue
+            # Prioritize specific Okazii price classes for robust extraction
+            price_container = item.select_one('.item-price, .product-price, .price-container, .price, .pret')
+            if price_container:
+                int_part = price_container.select_one('.pret_int')
+                dec_part = price_container.select_one('.pret_dec')
+                
+                if int_part:
+                    # Okazii uses '.' as thousands separator, remove it
+                    int_val = int_part.get_text(strip=True).replace('.', '')
+                    dec_val = dec_part.get_text(strip=True) if dec_part else "00"
+                    try:
+                        raw_price = float(f"{int_val}.{dec_val}")
+                    except ValueError:
+                        pass
+                else:
+                    # Fallback for text-based extraction
+                    price_text = price_container.get_text(separator=" ", strip=True)
+                    # Handle "35 00 Lei" or "1.500 00 Lei"
+                    # Remove dots that are thousands separators (followed by 3 digits)
+                    clean_text = re.sub(r'(\d)\.(\d{3})', r'\1\2', price_text)
+                    nums = re.findall(r'(\d+)', clean_text)
+                    if len(nums) >= 2:
+                        try:
+                            raw_price = float(f"{nums[0]}.{nums[1]}")
+                        except ValueError:
+                            pass
+                    elif len(nums) == 1:
+                        try:
+                            raw_price = float(nums[0])
+                        except ValueError:
+                            pass
+                
+                if 'eur' in price_container.get_text().lower() or '€' in price_container.get_text():
+                    currency = "EUR"
+            
+            if raw_price == 0.0: continue
             
             normalized_usd = raw_price * Config.RON_TO_USD if currency == "RON" else raw_price * Config.EUR_TO_USD
             
-            # Extract Image
-            img_el = soup.select_one('#main-image-placeholder img, .gallery-top-wrapper img')
-            image_url = img_el.get('src', '') if img_el else ""
-            if not image_url:
-                img_meta = soup.find('meta', property='og:image')
-                image_url = img_meta.get('content', '') if img_meta else ""
-
-            # Attempt a grade scrape out of title
-            grade = eBaySource.extract_grade(title)
+            # Image Extraction
+            img_el = item.select_one('.item-image img, .product-image img, a.Th img')
+            image_url = ""
+            if img_el:
+                image_url = img_el.get('data-src') or img_el.get('src') or ""
             
-            # Date extraction for JS sorting (YYYY-MM-DD works natively in JS timestamp conversions)
+            # Date Extraction
+            meta_container = item.select_one('.item-meta, .product-meta')
             date_str = "Active"
             if is_sold:
-                d_match = re.search(r'expirat la:\s*(\d{1,2})\.(\d{1,2})\.(\d{4})', page_text, re.I)
-                if d_match:
-                    date_str = f"{d_match.group(3)}-{d_match.group(2)}-{d_match.group(1)}"
+                if meta_container:
+                    meta_text = meta_container.get_text(separator=" ", strip=True)
+                    # Pattern for 'ieri', 'azi', or '29 ian.'
+                    date_match = re.search(r'(ieri|azi|\d{1,2}\s+[a-z]{3})', meta_text.lower())
+                    if date_match:
+                        date_str = cls._parse_romanian_date(date_match.group(0))
+                    else:
+                        date_str = "Recent"
                 else:
                     date_str = "Recent"
 
-            # Proper Chunking Validation
+            # Integrity Validation
             is_valid = True
             rejection_reason = None
             title_lower = title.lower()
             
             if str(target_year) not in title:
                 is_valid, rejection_reason = False, "YEAR_MISSING"
-                
-            if nominal.lower() not in title_lower:
+            elif nominal.lower() not in title_lower:
                 is_valid, rejection_reason = False, f"NOMINAL_PHRASE_MISSING_{nominal.upper()}"
-            
-            # Country Check for Okazii (mostly Romanian, so include variants)
-            country_keywords = [k.lower() for k in country.split() if len(k) > 2]
-            if country.lower() == "romania": country_keywords.extend(["românia", "rumänien"])
-            if not any(kw in title_lower for kw in country_keywords):
-                is_valid, rejection_reason = False, "COUNTRY_MISSING"
+            else:
+                country_keywords = [k.lower() for k in country.split() if len(k) > 2]
+                if country.lower() == "romania": 
+                    country_keywords.extend(["românia", "rumänien", "lei", "ban", "bani"])
+                if not any(kw in title_lower for kw in country_keywords):
+                    is_valid, rejection_reason = False, "COUNTRY_MISSING"
+                elif not cls.validate_integrity(title, str(target_year)):
+                    is_valid, rejection_reason = False, "FAILED_INTEGRITY_CHECK"
 
-            info_str = title
             results.append({
                 "source": "Okazii",
                 "country": country,
                 "nominal": nominal,
                 "year": str(target_year),
-                "grade": grade,
-                "info": info_str,
+                "grade": eBaySource.extract_grade(title),
+                "info": title,
                 "price_usd": round(normalized_usd, 2),
                 "item_url": link,
                 "image_url": image_url,
